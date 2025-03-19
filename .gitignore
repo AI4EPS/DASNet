@@ -1,0 +1,6 @@
+**/wandb
+**/*png
+**/training_test
+**/*csv
+**/results
+**/__pycache__
