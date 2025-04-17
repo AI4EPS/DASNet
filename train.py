@@ -17,9 +17,50 @@ import argparse
 
 logger = logging.getLogger("DASNet")
 
-def evaluate():
-    return 0
+def evaluate(model, data_loader, scaler, args, epoch=0, total_samples=1):
+    model.eval()
+    metric_logger = utils.MetricLogger(delimiter="  ")
+    metric_logger.add_meter("loss", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
 
+    loss_keys = ['loss_classifier', 'loss_box_reg', 'loss_mask', 'loss_objectness', 'loss_rpn_box_reg']
+    for key in loss_keys:
+        metric_logger.add_meter(key, utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
+
+    header = "Eval:"
+    processed_samples = 0
+
+    with torch.inference_mode():
+        for images, targets in metric_logger.log_every(data_loader, args.print_freq, header):
+            images = [img.to(args.device) for img in images]
+            targets = [{k: v.to(args.device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
+
+            loss_dict = model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+
+            batch_size = len(images)
+            metric_logger.update(loss=losses.item())
+
+            for key in loss_keys:
+                if key in loss_dict:
+                    metric_logger.update(**{key: loss_dict[key].item()})
+
+            processed_samples += batch_size
+            if processed_samples >= total_samples:
+                break
+
+    metric_logger.synchronize_between_processes()
+    print(f"Test Loss: {metric_logger.loss.global_avg:.6f}")
+
+    if args.wandb and utils.is_main_process():
+        wandb.log({
+            "test/loss": metric_logger.loss.global_avg,
+            "test/epoch": epoch,
+            **{f"test/{key}": metric_logger.meters[key].global_avg for key in loss_keys if key in metric_logger.meters}
+        })
+
+    del images, targets, loss_dict
+
+    return metric_logger
 
 def train_one_epoch(
     model, 
@@ -121,8 +162,60 @@ def train_one_epoch(
             break
 
 
-def collate_fn_coco(batch):
-    return tuple(zip(*batch))
+# data augmentationL streching
+import torchvision.transforms.functional as TF
+def resize_sample(image, target, output_size):
+    orig_h, orig_w = image.shape[1:]
+    new_h, new_w = output_size
+
+    scale_y = new_h / orig_h
+    scale_x = new_w / orig_w
+
+    # Resize image
+    image = TF.resize(image, output_size)
+
+    # Resize masks
+    if 'masks' in target:
+        target['masks'] = TF.resize(target['masks'], output_size)
+
+    # Resize attention masks
+    if 'attention_masks' in target:
+        target['attention_masks'] = TF.resize(target['attention_masks'], output_size)
+
+    # Scale boxes
+    if 'boxes' in target:
+        boxes = target['boxes'].clone()
+        boxes[:, [0, 2]] *= scale_x  # x1, x2
+        boxes[:, [1, 3]] *= scale_y  # y1, y2
+        target['boxes'] = boxes
+
+    # Scale area
+    if 'area' in target:
+        target['area'] = target['area'] * (scale_x * scale_y)
+
+    return image, target
+
+
+# def collate_fn_coco(batch):
+#     return tuple(zip(*batch))
+import random
+def collate_fn_coco(batch, resize=False):
+    images = []
+    targets = []
+    resize_h_factor = random.uniform(0.8, 1.1)
+    resize_w_factor = random.uniform(0.6, 1.1)
+    output_size = (
+        int(1422 * resize_h_factor),
+        int(6000 * resize_w_factor)
+    )
+    for image, target in batch:
+        if resize:
+            image, target = resize_sample(image, target, output_size)
+        images.append(image)
+        targets.append(target)
+
+    return images, targets
+
 
 
 def get_lr(it, max_lr, min_lr, warmup_steps, max_steps):
@@ -180,7 +273,7 @@ def main(args):
         ann_path=args.anno_path,
         root_dir=args.data_path,
         device=device,
-        target_size=(948, 4000),
+        target_size=(1422, 6000),
         synthetic_noise=False
     )
     dataset_test = DASNet__SeaFOAMDataset(
@@ -198,7 +291,7 @@ def main(args):
         sampler=train_sampler,
         num_workers=args.workers,
         pin_memory=True,
-        collate_fn=collate_fn_coco,
+        collate_fn=lambda batch: collate_fn_coco(batch, resize=True),
         drop_last=True
     )
     data_loader_test = DataLoader(
@@ -225,8 +318,8 @@ def main(args):
         rpn_post_nms_top_n_train=2000,
         rpn_post_nms_top_n_test=1000,
         box_positive_fraction=0.25,
-        max_size=4000,
-        min_size=948
+        max_size=6000,
+        min_size=1422
     )
     logger.info("Model:\n{}".format(model))
 
@@ -304,7 +397,7 @@ def main(args):
         print(f"Training time of epoch {epoch} of rank {rank}: {time.time() - tmp_time:.3f}")
 
         # TODO: add evaluate function
-        # test_metric_logger = evaluate(model, data_loader_test, scaler, args, epoch, len(data_loader_test))
+        test_metric_logger = evaluate(model, data_loader_test, scaler, args, epoch, len(data_loader_test))
 
         # save checkpoint
         if args.output_dir and utils.is_main_process():
@@ -318,14 +411,14 @@ def main(args):
             torch.save(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
             torch.save(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
 
-            # if test_metric_logger.loss.global_avg < best_loss:
-            #     best_loss = test_metric_logger.loss.global_avg
-            #     torch.save(checkpoint, os.path.join(args.output_dir, "model_best.pth"))
+            if test_metric_logger.loss.global_avg < best_loss:
+                best_loss = test_metric_logger.loss.global_avg
+                torch.save(checkpoint, os.path.join(args.output_dir, "model_best.pth"))
 
-            #     if args.wandb:
-            #         best_model = wandb.Artifact("best_model", type="model")
-            #         best_model.add_file(os.path.join(args.output_dir, "model_best.pth"))
-            #         wandb.log_artifact(best_model)
+                if args.wandb:
+                    best_model = wandb.Artifact("best_model", type="model")
+                    best_model.add_file(os.path.join(args.output_dir, "model_best.pth"))
+                    wandb.log_artifact(best_model)
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
