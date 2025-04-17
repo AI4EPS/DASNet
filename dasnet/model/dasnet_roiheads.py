@@ -1227,7 +1227,7 @@ class DASNet__RoIHeads(nn.Module):
 
             if self.mask_roi_pool is not None:
                 original_img_shapes = image_shapes
-                mask_proposals, image_shapes = crop_mask_proposals_and_expand(mask_proposals, image_shapes, alpha=0.8)
+                mask_proposals, image_shapes = crop_mask_proposals_and_expand(mask_proposals, image_shapes, alpha=1)
                 
                 scales = calculate_expansion_scale(original_img_shapes, image_shapes)
                 features = expand_features(features, scales)
