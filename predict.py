@@ -99,7 +99,7 @@ def extract_peak_points(matrix, x_range, y_range, threshold=0.5, sigma=5, is_fil
     return filtered_points, points_value
 
 
-def postprocess_dasnet(filenames, output, alpha=0.8):
+def postprocess_dasnet(filenames, output, alpha=1):
     """Post-process the DASNet model output, handling mask cropping."""
     batch_size = len(filenames)
 
@@ -274,13 +274,13 @@ def pred_dasnet(args, model, data_loader, pick_path, figure_path):
                     plot_das_predictions(
                         images[i].cpu().numpy(),
                         selected_results,
-                        os.path.join(figure_path, file_name + ".png")
+                        os.path.join(figure_path, file_name + ".png"),
+                        args.min_prob
                     )
 
     if args.distributed:
         torch.distributed.barrier()
-
-    dist.destroy_process_group()
+        dist.destroy_process_group()
 
     return 0
 
@@ -318,7 +318,7 @@ def main(args):
     dataset = DASNet__ContinuousDataset(
         get_files(args.data_list),
         key_path=args.key_path if hasattr(args, 'key_path') else None,
-        target_size=(948, 4000),
+        target_size=(1422, 6000),
         pred_object=args.object,
         channel_range=[7400, 10245]
     )
@@ -347,8 +347,8 @@ def main(args):
         rpn_post_nms_top_n_train=2000,
         rpn_post_nms_top_n_test=1000,
         box_positive_fraction=0.25,
-        max_size=4000,
-        min_size=948
+        max_size=6000,
+        min_size=1422
     )
     logger.info("Model:\n{}".format(model))
 
@@ -376,7 +376,7 @@ def get_args_parser(add_help=True):
 
     # **Model-related parameters**
     parser.add_argument("--model", default="dasnet", type=str, help="Model name")
-    parser.add_argument("--model_path", type=str, default="", help="Path to the pre-trained model (.pth file)")
+    # parser.add_argument("--model_path", type=str, default="", help="Path to the pre-trained model (.pth file)")
     parser.add_argument("--resume", default="", type=str, help="Path to checkpoint for resuming inference")
 
     # **Device & computation**
