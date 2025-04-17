@@ -18,7 +18,7 @@ import argparse
 logger = logging.getLogger("DASNet")
 
 def evaluate(model, data_loader, scaler, args, epoch=0, total_samples=1):
-    model.eval()
+    model.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("loss", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
 
