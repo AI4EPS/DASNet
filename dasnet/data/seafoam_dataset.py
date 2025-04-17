@@ -92,10 +92,11 @@ class DASNet__SeaFOAMDataset(Dataset):
             rgb_input = file['rgb_input'][:]
 
         # data augmentation: synthetize with noise
+        is_synnoise = True
         syn_prob = 0.5
-        syn_factor = random.uniform(0.3, 0.7)
-        if self.synthetic_noise and np.random.rand() > syn_prob:
-            noise_df = pd.read_csv('noise.csv')
+        syn_factor = random.uniform(0.1, 0.4)
+        if is_synnoise and np.random.rand() > syn_prob:
+            noise_df = pd.read_csv('/home/chun/SeaFOAM_chun/Mask_RCNN/noise.csv')
             selected_path = noise_df.iloc[random.randint(0, len(noise_df) - 1)]['File Path']
             with h5py.File(selected_path, 'r') as file_noise:
                 rgb_input = rgb_input + file_noise['rgb_input'][:] * syn_factor
@@ -108,6 +109,15 @@ class DASNet__SeaFOAMDataset(Dataset):
         # resize image
         original_size = image.shape[1:]
         target_height, target_width = self.target_size
+
+        # data augmentation: stretching
+        is_resize = False
+        if is_resize:
+            resize_h_factor = random.uniform(0.8, 1.1)
+            resize_w_factor = random.uniform(0.6, 1.1)
+            target_height = int(target_height * resize_h_factor)
+            target_width = int(target_width * resize_w_factor)
+
         image = F.resize(image, (target_height, target_width))
         
         # Load labels and bounding boxes
@@ -163,7 +173,7 @@ class DASNet__SeaFOAMDataset(Dataset):
             attention_masks.append(attention_mask)
 
         # Vertical flip
-        is_Vflip = False
+        is_Vflip = True
         if random.random() > 0.5 and is_Vflip:
             # Flip image
             image = F.vflip(image)
