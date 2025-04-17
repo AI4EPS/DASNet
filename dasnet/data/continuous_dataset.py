@@ -32,7 +32,7 @@ class DASNet__ContinuousDataset(Dataset):
                 self.fs = fsspec.filesystem("gcs")
         
         if self.pred_object == 'default':
-            file_name = self.hdf5_files[idx]
+            file_name = self.hdf5_files.iloc[idx]['File Name']
             try:
                 with self.fs.open(file_name, "rb") as f:
                     with h5py.File(f, "r") as hf:
