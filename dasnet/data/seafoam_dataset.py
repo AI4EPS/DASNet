@@ -119,6 +119,16 @@ class DASNet__SeaFOAMDataset(Dataset):
             target_width = int(target_width * resize_w_factor)
 
         image = F.resize(image, (target_height, target_width))
+
+        # data augmentation: masking
+        is_masking = False
+        mask_prob = 0.5
+        if is_masking and np.random.rand() > mask_prob:
+            min_ratio, max_ratio = 0.1, 0.3
+            _, H, W = image.shape
+            num_mask_rows = int(H * random.uniform(min_ratio, max_ratio))
+            masked_rows = random.sample(range(H), num_mask_rows)
+            image[:, masked_rows, :] = 0.0
         
         # Load labels and bounding boxes
         boxes = []
@@ -142,23 +152,35 @@ class DASNet__SeaFOAMDataset(Dataset):
 
             iscrowd.append(ann.get('iscrowd', 0))
 
-            data = ann['segmentation'][0]
-            data = [(int(data[i] * scale_x), int(data[i+1] * scale_y)) for i in range(0, len(data), 2)]
-            data = interpolate_line_segments_int(data)
-
             height, width = target_height, target_width
             mask = np.zeros((height, width))
 
             # param for gauss distribution
             std_dev = 50 * scale_x
             amplitude = 1.0
-            for x, y in data:
-                if y < height:
-                    mask[y] += gaussian_line(x, std_dev, amplitude, width)
-            for i in range(height):
-                max_value = np.max(mask[:,i])
-                if max_value > 0:
-                    mask[:,i] /= max_value
+
+            for iseg in range(len(ann['segmentation'])):
+                data = ann['segmentation'][iseg]
+                if len(data) < 10:
+                    continue
+                data = [(int(data[i] * scale_x), int(data[i+1] * scale_y)) for i in range(0, len(data), 2)]
+                data = interpolate_line_segments_int(data)
+
+                for x, y in data:
+                    if y < height:
+                        mask[y] += gaussian_line(x, std_dev, amplitude, width)
+                # for i in range(height):
+                #     max_value = np.max(mask[i, :])
+                #     if max_value > amplitude:
+                #         mask[i, :] /= (max_value / amplitude)
+            row_max = np.max(mask, axis=1)
+            mask_rows_to_normalize = row_max > amplitude
+            scales = row_max[mask_rows_to_normalize] / amplitude
+            mask[mask_rows_to_normalize, :] /= scales[:, np.newaxis]
+
+            # name_idx = 0
+            # plot_mask(mask, title=f'a{name_idx}')
+            # name_idx += 1
             
             mask = (mask * 255).astype(np.uint8)
             masks.append(mask)
@@ -231,3 +253,17 @@ class DASNet__SeaFOAMDataset(Dataset):
             attention_mask[y_min:y_max, x_min:x_max] = 1
 
         return attention_mask
+
+
+import matplotlib.pyplot as plt
+
+def plot_mask(mask, title='Mask', figsize=(10, 5)):
+    plt.figure(figsize=figsize)
+    plt.imshow(mask, cmap='gray', aspect='auto', origin='upper')
+    plt.colorbar(label='Intensity')
+    plt.title(title)
+    plt.xlabel('Width (x)')
+    plt.ylabel('Height (y)')
+    plt.tight_layout()
+    plt.savefig(f'{title}.jpg')
+    plt.close()
