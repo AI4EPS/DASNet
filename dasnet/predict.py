@@ -223,23 +223,22 @@ def postprocess_dasnet(filenames, output, alpha=(1000 / 200) / 5.1):
     batch_size = len(filenames)
     results = []
 
-    # Move to CPU before Python-loop-heavy NMS and postprocessing
-    output = [{k: v.detach().cpu() for k, v in out.items()} for out in output]
     output = [mask_agnostic_nms_single_image(out) for out in output]
 
     for i in range(batch_size):
         result = {
-            "boxes": output[i]["boxes"].numpy(),
-            "scores": output[i]["scores"].numpy(),
-            "labels": output[i]["labels"].numpy(),
+            "boxes": output[i]["boxes"].detach().cpu().numpy(),
+            "scores": output[i]["scores"].detach().cpu().numpy(),
+            "labels": output[i]["labels"].detach().cpu().numpy(),
         }
 
         masks = output[i]["masks"]
         H_img, W_img = masks.shape[-2:]
 
         boxes = output[i]["boxes"]
+        masks = output[i]["masks"]
 
-        final_masks = torch.zeros((len(masks), H_img, W_img))
+        final_masks = torch.zeros((len(masks), H_img, W_img), device=masks.device)
 
         for j, (box, mask) in enumerate(zip(boxes, masks)):
             x_min, y_min, x_max, y_max = box.int()
@@ -448,20 +447,16 @@ def plot_das_predictions(input_data, predictions, save_path, score_threshold=0.8
     else:
         raise ValueError(f"plot_das_predictions: expected 2D or (C,W,H) array, got shape {arr.shape}")
 
-    # Pre-compute boxes, masks, and peaks once (shared across subplots)
+    # Pre-compute: composite mask, collect peaks and boxes once
     boxes = predictions["boxes"]
     masks = predictions["masks"]
     labels = predictions["labels"]
     scores = predictions["scores"]
-
-    # Get image dimensions from first channel view
     n_time, n_channel = channel_views[0].shape  # (W, H) = (time, channel)
 
-    # Filter by score and collect drawing data
     draw_items = []
     composite_mask = np.zeros((n_channel, n_time), dtype=np.float32)
     all_peak_x, all_peak_y = [], []
-    jet_colormap = plt.get_cmap("jet")
 
     for box, score, label, mask in zip(boxes, scores, labels, masks):
         if score <= score_threshold:
@@ -474,7 +469,7 @@ def plot_das_predictions(input_data, predictions, save_path, score_threshold=0.8
             continue
 
         if int(label) in [2, 3, 8, 9]:
-            display_mask = mask_2d.T  # (channel, time)
+            display_mask = mask_2d.T
             np.maximum(composite_mask, display_mask, out=composite_mask)
 
             peak_points, _ = extract_peak_points(
@@ -486,9 +481,12 @@ def plot_das_predictions(input_data, predictions, save_path, score_threshold=0.8
                 all_peak_x.extend(pts[:, 1].tolist())
                 all_peak_y.extend(pts[:, 0].tolist())
 
-    # Build single RGBA overlay from composite mask
-    rgba_overlay = jet_colormap(composite_mask)
-    rgba_overlay[..., 3] = np.where(composite_mask > mask_threshold, 0.5, 0.0).astype(np.float32)
+    # Downsample for faster rendering
+    ds = 4
+    composite_ds = composite_mask[::ds, ::ds]
+    jet_colormap = plt.get_cmap("jet")
+    rgba_overlay = jet_colormap(composite_ds)
+    rgba_overlay[..., 3] = np.where(composite_ds > mask_threshold, 0.5, 0.0).astype(np.float32)
 
     fig, axes = plt.subplots(3, 1, figsize=(7 * 7 / 2 * 0.6, 3 * 7 * 7 / 8 * 0.6))
 
@@ -496,18 +494,18 @@ def plot_das_predictions(input_data, predictions, save_path, score_threshold=0.8
         display_img = channel_views[idx].T  # (channel, time)
         vmin = np.percentile(display_img, 10)
         vmax = np.percentile(display_img, 90)
-        ax.imshow(display_img, cmap="seismic", vmin=vmin, vmax=vmax, aspect="auto", origin="lower", rasterized=True)
-        ax.imshow(rgba_overlay, aspect="auto", origin="lower")
+        ax.imshow(display_img[::ds, ::ds], cmap="seismic", vmin=vmin, vmax=vmax,
+                  aspect="auto", origin="lower", rasterized=True,
+                  extent=[0, n_time, 0, n_channel])
+        ax.imshow(rgba_overlay, aspect="auto", origin="lower",
+                  extent=[0, n_time, 0, n_channel])
 
         for box, score, label in draw_items:
             x_min, y_min, x_max, y_max = box
             rect = patches.Rectangle(
                 (float(y_min), float(x_min)),
-                float(y_max - y_min),
-                float(x_max - x_min),
-                linewidth=4,
-                edgecolor="r",
-                facecolor="none",
+                float(y_max - y_min), float(x_max - x_min),
+                linewidth=4, edgecolor="r", facecolor="none",
             )
             ax.add_patch(rect)
             label_text = label_map.get(int(label), f"class {label}")
