@@ -223,22 +223,23 @@ def postprocess_dasnet(filenames, output, alpha=(1000 / 200) / 5.1):
     batch_size = len(filenames)
     results = []
 
+    # Move to CPU before Python-loop-heavy NMS and postprocessing
+    output = [{k: v.detach().cpu() for k, v in out.items()} for out in output]
     output = [mask_agnostic_nms_single_image(out) for out in output]
 
     for i in range(batch_size):
         result = {
-            "boxes": output[i]["boxes"].detach().cpu().numpy(),
-            "scores": output[i]["scores"].detach().cpu().numpy(),
-            "labels": output[i]["labels"].detach().cpu().numpy(),
+            "boxes": output[i]["boxes"].numpy(),
+            "scores": output[i]["scores"].numpy(),
+            "labels": output[i]["labels"].numpy(),
         }
 
         masks = output[i]["masks"]
         H_img, W_img = masks.shape[-2:]
 
         boxes = output[i]["boxes"]
-        masks = output[i]["masks"]
 
-        final_masks = torch.zeros((len(masks), H_img, W_img), device=masks.device)
+        final_masks = torch.zeros((len(masks), H_img, W_img))
 
         for j, (box, mask) in enumerate(zip(boxes, masks)):
             x_min, y_min, x_max, y_max = box.int()
@@ -447,30 +448,59 @@ def plot_das_predictions(input_data, predictions, save_path, score_threshold=0.8
     else:
         raise ValueError(f"plot_das_predictions: expected 2D or (C,W,H) array, got shape {arr.shape}")
 
+    # Pre-compute boxes, masks, and peaks once (shared across subplots)
+    boxes = predictions["boxes"]
+    masks = predictions["masks"]
+    labels = predictions["labels"]
+    scores = predictions["scores"]
+
+    # Get image dimensions from first channel view
+    n_time, n_channel = channel_views[0].shape  # (W, H) = (time, channel)
+
+    # Filter by score and collect drawing data
+    draw_items = []
+    composite_mask = np.zeros((n_channel, n_time), dtype=np.float32)
+    all_peak_x, all_peak_y = [], []
+    jet_colormap = plt.get_cmap("jet")
+
+    for box, score, label, mask in zip(boxes, scores, labels, masks):
+        if score <= score_threshold:
+            continue
+        x_min, y_min, x_max, y_max = box
+        draw_items.append((box, score, label))
+
+        mask_2d = np.squeeze(mask)
+        if mask_2d.ndim != 2:
+            continue
+
+        if int(label) in [2, 3, 8, 9]:
+            display_mask = mask_2d.T  # (channel, time)
+            np.maximum(composite_mask, display_mask, out=composite_mask)
+
+            peak_points, _ = extract_peak_points(
+                mask_2d, [int(x_min), int(x_max)], [int(y_min), int(y_max)],
+                threshold=0.5, is_filt=False, is_gauss=True
+            )
+            if len(peak_points) > 0:
+                pts = np.array(peak_points)
+                all_peak_x.extend(pts[:, 1].tolist())
+                all_peak_y.extend(pts[:, 0].tolist())
+
+    # Build single RGBA overlay from composite mask
+    rgba_overlay = jet_colormap(composite_mask)
+    rgba_overlay[..., 3] = np.where(composite_mask > mask_threshold, 0.5, 0.0).astype(np.float32)
+
     fig, axes = plt.subplots(3, 1, figsize=(7 * 7 / 2 * 0.6, 3 * 7 * 7 / 8 * 0.6))
 
     for idx, ax in enumerate(axes):
-        image_data = np.asarray(channel_views[idx], dtype=np.float32)
-        # Display x=time, y=channel -> show (channel, time) so imshow puts time on x-axis
-        display_img = image_data.T  # (H, W) = (channel, time)
-        n_channel, n_time = display_img.shape
-
-        plt.sca(ax)
+        display_img = channel_views[idx].T  # (channel, time)
         vmin = np.percentile(display_img, 10)
         vmax = np.percentile(display_img, 90)
         ax.imshow(display_img, cmap="seismic", vmin=vmin, vmax=vmax, aspect="auto", origin="lower", rasterized=True)
+        ax.imshow(rgba_overlay, aspect="auto", origin="lower")
 
-        boxes = predictions["boxes"]
-        masks = predictions["masks"]
-        labels = predictions["labels"]
-        scores = predictions["scores"]
-
-        for box, score, label, mask in zip(boxes, scores, labels, masks):
-            if score <= score_threshold:
-                continue
-            # box: (x_min, y_min, x_max, y_max) = (channel_min, time_min, channel_max, time_max)
+        for box, score, label in draw_items:
             x_min, y_min, x_max, y_max = box
-            # Display coords: x = time (y_min..y_max), y = channel (x_min..x_max)
             rect = patches.Rectangle(
                 (float(y_min), float(x_min)),
                 float(y_max - y_min),
@@ -483,37 +513,17 @@ def plot_das_predictions(input_data, predictions, save_path, score_threshold=0.8
             label_text = label_map.get(int(label), f"class {label}")
             ax.text(float(y_min) + 40, float(x_max) - 20, f"{label_text}\n{score:.2f}", fontsize=10)
 
-            # mask: (time, channel) = (H_img, W_img); for overlay on display (channel, time) use mask.T
-            mask_2d = np.squeeze(mask)
-            if mask_2d.ndim != 2:
-                continue
-            display_mask = mask_2d.T  # (channel, time)
-
-            alpha_mask = np.zeros_like(display_mask, dtype=np.float32)
-            if label in [2, 3, 8, 9]:
-                alpha_mask[display_mask > mask_threshold] = 0.5
-            jet_colormap = plt.get_cmap("jet")
-            rgba_mask = jet_colormap(display_mask)
-            rgba_mask[..., 3] = alpha_mask
-            ax.imshow(rgba_mask, aspect="auto", origin="lower")
-
-            # extract_peak_points: mask (time, channel), returns (peak_x, peak_y) = (channel_idx, time_idx)
-            peak_points, _ = extract_peak_points(
-                mask_2d, [int(x_min), int(x_max)], [int(y_min), int(y_max)],
-                threshold=0.5, is_filt=False, is_gauss=True
-            )
-            if len(peak_points) > 0 and label in [2, 3, 8, 9]:
-                # display: x=time, y=channel -> scatter (time_idx, channel_idx)
-                pts = np.array(peak_points)
-                ax.scatter(pts[:, 1], pts[:, 0], color="white", s=1)
+        if all_peak_x:
+            ax.scatter(all_peak_x, all_peak_y, color="white", s=1)
 
         ax.set_xlim(0, n_time)
         ax.set_ylim(0, n_channel)
         ax.set_ylabel("Channel index")
         if idx == 2:
             ax.set_xlabel("Time (sample index)")
+
     plt.tight_layout()
-    plt.savefig(save_path, bbox_inches="tight")
+    plt.savefig(save_path, bbox_inches="tight", dpi=150)
     plt.close()
 
 
