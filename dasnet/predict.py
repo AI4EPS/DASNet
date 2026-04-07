@@ -504,8 +504,8 @@ def plot_das_predictions(input_data, predictions, save_path, score_threshold=0.8
             )
             if len(peak_points) > 0 and label in [2, 3, 8, 9]:
                 # display: x=time, y=channel -> scatter (time_idx, channel_idx)
-                for px, py in peak_points:
-                    ax.scatter(py, px, color="white", s=1)
+                pts = np.array(peak_points)
+                ax.scatter(pts[:, 1], pts[:, 0], color="white", s=1)
 
         ax.set_xlim(0, n_time)
         ax.set_ylim(0, n_channel)
