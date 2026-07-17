@@ -1,6 +1,10 @@
-**/wandb
-**/*png
-**/training_test
-**/*csv
-**/results
-**/__pycache__
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+output/
+results/
+wandb/
+*.pth
+*.h5

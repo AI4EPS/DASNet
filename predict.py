@@ -1,418 +1,413 @@
-import os
-import torch
-import torch.nn.functional as F
-import pandas as pd
-from tqdm import tqdm
-from contextlib import nullcontext
-import csv
-from collections import defaultdict
-import numpy as np
-from scipy.ndimage import gaussian_filter
-import utils
+"""Run local DASNet inference on HDF5 files listed in a CSV."""
+
+from __future__ import annotations
+
+import argparse
 import json
-from dasnet.data.continuous_dataset import DASNet__ContinuousDataset
-import torch.multiprocessing as mp
+import os
+from contextlib import nullcontext
+
+import numpy as np
+import pandas as pd
+import torch
+from matplotlib import pyplot as plt
+from matplotlib.patches import Rectangle
+from scipy.ndimage import gaussian_filter
 from torch.utils.data import DataLoader
-from torch.nn.parallel import DistributedDataParallel as DDP
-import logging
-from dasnet.model.dasnet import build_model
-import fsspec
-import torch.distributed as dist
-# TODO: add function for skipping exist files, add function to control input size, plot for 3 channels
 
-label_map = {
-    1: "Blue whale A",
-    2: "Blue whale B",
-    3: "Fin whale",
-    4: "Others",
-    5: "Down sweep",
-    6: "T wave",
-    7: "Ship",
-    8: "Sediment flow",
-    9: "P wave",
-    10: "S wave"
-}
-logger = logging.getLogger()
-
-def get_files(data_list):
-    if data_list == '':
-        if utils.is_main_process():
-            print("Searching files ...")
-        # GCS Key path
-        default_key_path = "/nfs/quakeflow_dataset/SeaFOAM/x-berkeley-mbari-das-8c2333fca1b2.json"
-        fs = fsspec.filesystem("gcs", token=default_key_path)
-
-        # hdf5 file name
-        hdf5_files = []
-        folders = fs.ls("berkeley-mbari-das/")
-        for folder in folders:
-            if folder.split("/")[-1] in ["ContextData", "MBARI_cable_geom_dx10m.csv"]:
-                continue
-            years = fs.ls(folder)
-            for year in years:
-                jdays = fs.ls(year)
-                for jday in jdays:
-                    files = fs.ls(jday)
-                    for file in files:
-                        if file.endswith(".h5") and os.path.basename(file).startswith("MBARI_F8_STU_GL20m_OCP5m_FS200Hz_2023-11-0"): #MBARI_F8_STU_GL20m_OCP5m_FS200Hz_2024-12-3
-                            hdf5_files.append(file)
-        if utils.is_main_process():
-            print(f'Total file number: {len(hdf5_files)}')
-    else:
-        hdf5_files = pd.read_csv(args.data_list)
-        if utils.is_main_process():
-            print(f'Total file number: {len(hdf5_files)}')
-
-    return hdf5_files
-        
-
-def extract_peak_points(matrix, x_range, y_range, threshold=0.5, sigma=5, is_filt=True):
-    matrix = gaussian_filter(matrix, sigma=sigma)
-
-    points = []
-    points_value = []
-    for y in range(matrix.shape[0]):
-        row = matrix[y]
-        peak_x = np.argmax(row)
-        peak_value = row[peak_x]
-        if peak_value > threshold and x_range[0] < peak_x < x_range[1] and y_range[0] < y < y_range[1]:
-            points.append([float(peak_x), float(y)])
-            points_value.append(peak_value)
-
-    if is_filt:
-        lines = defaultdict(list)
-        for x, y in points:
-            lines[x].append(y)
-
-        filtered_points = []
-        for x, y_list in lines.items():
-            y_list.sort()
-            mid_index = len(y_list) // 2
-            sampled_y = y_list[mid_index]
-            filtered_points.append([x, sampled_y])
-    else:
-        filtered_points = sorted(points, key=lambda point: point[1])
-
-    if len(filtered_points) == 0:
-        filtered_points = []
-
-    return filtered_points, points_value
+from dasnet.data.das import DASInferDataset
+from dasnet.model.dasnet import build_model as build_dasnet_model
+from dasnet.model.rpn_anchor_config import resolve_rpn_anchor_sizes
 
 
-def postprocess_dasnet(filenames, output, alpha=1):
-    """Post-process the DASNet model output, handling mask cropping."""
-    batch_size = len(filenames)
-
-    results = []
-    for i in range(batch_size):
-        result = {
-            "boxes": output[i]["boxes"].detach().cpu().numpy(),
-            "scores": output[i]["scores"].detach().cpu().numpy(),
-            "labels": output[i]["labels"].detach().cpu().numpy(),
-        }
-
-        # orignal data shape
-        masks = output[i]['masks']
-        H_img, W_img = masks.shape[-2:]
-
-        # handling mask
-        boxes = output[i]["boxes"]
-        masks = output[i]["masks"]  # (N, 1, H_crop, W_crop)
-
-        final_masks = torch.zeros((len(masks), H_img, W_img), device=masks.device)
-
-        for j, (box, mask) in enumerate(zip(boxes, masks)):
-            x_min, y_min, x_max, y_max = box.int()
-            cropped_mask = mask[:, y_min:y_max, x_min:x_max]  # Crop mask to the box region
-
-            height = y_max - y_min
-            cropped_width = int(height * alpha)
-
-            # resize mask
-            resized_mask = F.interpolate(
-                cropped_mask.unsqueeze(0),
-                size=(height, cropped_width),
-                mode="bilinear",
-                align_corners=False
-            ).squeeze(0)
-
-            full_box_mask = torch.zeros((height, x_max - x_min), device=masks.device)
-
-            # ensure resized_mask dimensions match full_box_mask
-            cropped_width = min(cropped_width, full_box_mask.shape[1])
-            resized_mask = resized_mask[:, :, :cropped_width]
-
-            full_box_mask[:, :cropped_width] = resized_mask
-            final_masks[j, y_min:y_max, x_min:x_max] = full_box_mask
-
-        result["masks"] = final_masks.cpu().numpy()
-        results.append(result)
-
-    return filenames, results
+def parse_anchor_sizes(value: str):
+    """Parse comma-separated RPN anchor sizes, optionally grouped by semicolon."""
+    groups = [group.strip() for group in value.split(";") if group.strip()]
+    if not groups:
+        return None
+    parsed = [
+        tuple(int(item.strip()) for item in group.split(",") if item.strip())
+        for group in groups
+    ]
+    if any(not group or any(item <= 0 for item in group) for group in parsed):
+        raise ValueError("RPN anchor sizes must be positive integers.")
+    return tuple((item,) for item in parsed[0]) if len(parsed) == 1 else tuple(parsed)
 
 
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-def plot_das_predictions(input_data, predictions, save_path, score_threshold=0.8, mask_threshold=0.25):    
-    # Load the image
-    # image = Image.fromarray(image_path, 'L')
-    image_data = np.array(input_data[2], dtype=np.float32)
-    plt.figure(figsize=(16, 4))
-    plt.imshow(image_data, cmap='seismic', rasterized=True)
-    # plt.axis('off')
-
-    ax = plt.gca()
-
-    boxes = predictions['boxes']
-    masks = predictions['masks']
-    labels = predictions['labels']
-    scores = predictions['scores']
-    
-    for box, score, label, mask in zip(boxes, scores, labels, masks):
-        if score > score_threshold:
-            x1, y1, x2, y2 = box
-            
-            rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=4,
-                                     edgecolor='r', facecolor='none')
-            ax.add_patch(rect)
-            label_text = label_map[label] if label in label_map else f'class {label}'
-            plt.text(x1, y2 - 50, f'{label_text}\n{score:.2f}', bbox=dict(facecolor='yellow', alpha=1))
-
-            mask = mask.squeeze()
-
-            # sigma = 5
-            # smooth_mask = gaussian_filter(mask, sigma=sigma)
-            smooth_mask = mask
-
-            alpha_mask = smooth_mask.copy()
-
-            # if label in [2, 3, 4, 9, 10]:
-            #     alpha_mask[alpha_mask <= mask_threshold] = 0
-            #     alpha_mask[alpha_mask > mask_threshold] = 0.5
-            # else:
-            #     alpha_mask[:] = 0
-            alpha_mask = (mask > mask_threshold).astype(float) * 0.5
-
-            jet_colormap = plt.get_cmap('jet')
-            rgba_mask = jet_colormap(smooth_mask)
-
-            rgba_mask[..., 3] = alpha_mask
-
-            ax.imshow(rgba_mask)
-
-            peak_points, _ = extract_peak_points(mask, [x1, x2], [y1, y2], threshold=0.5)
-            if len(peak_points) > 0:
-                peak_x, peak_y = zip(*peak_points)
-                plt.scatter(peak_x, peak_y, color='white', s=1)
-
-    plt.savefig(
-        os.path.join(save_path),
-        bbox_inches='tight',
-        pad_inches=0,
-        # dpi=300
+def parse_anchor_ratios(value: str):
+    """Parse semicolon-separated groups of positive RPN aspect ratios."""
+    groups = [group.strip() for group in value.split(";") if group.strip()]
+    if not groups:
+        return None
+    parsed = tuple(
+        tuple(float(item.strip()) for item in group.split(",") if item.strip())
+        for group in groups
     )
-    plt.close()
+    if any(not group or any(item <= 0 for item in group) for group in parsed):
+        raise ValueError("RPN aspect ratios must be positive.")
+    return parsed
 
 
-def pred_dasnet(args, model, data_loader, pick_path, figure_path):
-    """Run inference on DASNet dataset using Mask R-CNN."""
-    
-    model.eval()
-    ctx = nullcontext() if args.device == "cpu" else torch.amp.autocast(device_type=args.device, dtype=args.ptdtype)
+def parse_mask_streams(value: str) -> dict[int, int]:
+    """Parse category-to-mask-stream mappings such as ``1:2,2:1``."""
+    streams = {}
+    for item in (part.strip() for part in value.split(",")):
+        if not item:
+            continue
+        try:
+            category, count = item.split(":", 1)
+            streams[int(category)] = int(count)
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid mask stream mapping {item!r}; use category:count."
+            ) from error
+    if any(count < 1 for count in streams.values()):
+        raise ValueError("Mask-stream counts must be positive.")
+    return streams
 
-    with torch.inference_mode():
-        for images, filenames in tqdm(data_loader, desc="Predicting", total=len(data_loader)):
-            images = [img.to(args.device) for img in images]
 
-            with ctx:
-                output = model(images)
-                filenames, output = postprocess_dasnet(filenames, output)
+def collate_batch(batch):
+    return tuple(zip(*batch))
 
-            for i in range(len(filenames)):
-                file_name = filenames[i]
-                scores = output[i]["scores"]
-                
-                # only save predictions with scores higher than threshold
-                mask_threshold = args.min_prob
-                keep_idx = scores > mask_threshold
-                selected_results = {
-                    "boxes": output[i]["boxes"][keep_idx],
-                    "scores": scores[keep_idx],
-                    "masks": output[i]["masks"][keep_idx],
-                    "labels": output[i]["labels"][keep_idx],
+
+def read_input_paths(csv_path: str, from_raw: bool) -> tuple[list[str], list[str]]:
+    """Read HDF5 paths from a standard or raw-input CSV."""
+    frame = pd.read_csv(csv_path)
+    path_column = "File Path" if from_raw and "File Path" in frame.columns else "path"
+    if path_column not in frame.columns:
+        raise ValueError(f"{csv_path} must contain a '{path_column}' column.")
+    paths = frame[path_column].astype(str).tolist()
+    names = (
+        frame["File Name"].astype(str).tolist()
+        if from_raw and "File Name" in frame.columns
+        else [os.path.basename(path) for path in paths]
+    )
+    missing = [path for path in paths if not path.startswith("gs://") and not os.path.isfile(path)]
+    if missing:
+        raise FileNotFoundError(f"Input file does not exist: {missing[0]}")
+    return paths, names
+
+
+def extract_picks(mask: np.ndarray, box: np.ndarray, threshold: float) -> tuple[list[list[float]], list[float]]:
+    """Extract the strongest mask peak for every channel inside a detection box."""
+    smoothed = gaussian_filter(mask, sigma=5)
+    x0, y0, x1, y1 = (int(round(value)) for value in box)
+    x0, x1 = max(x0, 0), min(x1, smoothed.shape[1])
+    y0, y1 = max(y0, 0), min(y1, smoothed.shape[0])
+    if x0 >= x1 or y0 >= y1:
+        return [], []
+    points, scores = [], []
+    for channel in range(x0, x1):
+        column = smoothed[y0:y1, channel]
+        if not column.size:
+            continue
+        offset = int(column.argmax())
+        score = float(column[offset])
+        if score >= threshold:
+            points.append([float(channel), float(y0 + offset)])
+            scores.append(score)
+    return points, scores
+
+
+def active_mask_streams(prediction: dict, index: int, streams_by_category: dict[int, int]):
+    """Return the mask streams configured for a predicted instance."""
+    count = streams_by_category.get(int(prediction["labels"][index]), 1)
+    all_streams = prediction.get(
+        "mask_streams_all",
+        prediction.get("mask_streams", [prediction["masks"]]),
+    )
+    return [
+        np.asarray(np.squeeze(stream[index]), dtype=np.float32)
+        for stream in all_streams[:count]
+    ]
+
+
+def prediction_record(file_name: str, prediction: dict, args) -> dict:
+    """Convert one model prediction to the compact public JSON format."""
+    scale_back = 1.0 / args.resize_scale
+    keep = np.flatnonzero(prediction["scores"] >= args.min_probability)
+    instances = []
+    for index in keep:
+        box = prediction["boxes"][index]
+        streams = active_mask_streams(prediction, index, args.mask_streams_by_category)
+        stream_records = []
+        for stream_index, mask in enumerate(streams):
+            picks, pick_scores = extract_picks(mask, box, args.mask_threshold)
+            stream_records.append(
+                {
+                    "stream": stream_index,
+                    "picks": [[x * scale_back, y * scale_back] for x, y in picks],
+                    "pick_scores": pick_scores,
                 }
+            )
+        instances.append(
+            {
+                "box": [float(value) * scale_back for value in box],
+                "score": float(prediction["scores"][index]),
+                "label": int(prediction["labels"][index]),
+                "picks_by_stream": stream_records,
+            }
+        )
+    return {
+        "file_name": os.path.basename(file_name),
+        "resize_scale": args.resize_scale,
+        "instances": instances,
+    }
 
-                # empty file for no predictions
-                if len(selected_results["scores"]) == 0:
-                    # with open(os.path.join(pick_path, file_name + ".csv"), "a"):
-                    #     pass
-                    continue
 
-                # save peak points instead of masks
-                peak_points_list = []
-                for j in range(len(selected_results["scores"])):
-                    mask = selected_results["masks"][j]  # (1, H, W) -> (H, W)
-                    x_min, y_min, x_max, y_max = selected_results["boxes"][j]
-                    x_range = (x_min, x_max)
-                    y_range = (y_min, y_max)
+def save_prediction_figure(file_name: str, image: torch.Tensor, prediction: dict, args):
+    """Save the three input channels with predicted boxes, masks, and picks."""
+    scores = prediction["scores"]
+    keep = np.flatnonzero(scores >= args.min_probability)
+    views = [image[min(index, image.shape[0] - 1)].numpy() for index in range(3)]
+    figure, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+    colors = ("cyan", "magenta", "lime")
 
-                    peak_points, _ = extract_peak_points(mask, x_range, y_range, threshold=0.5, is_filt=True)
-                    peak_points_list.append(peak_points)
-
-                with open(os.path.join(pick_path, file_name + ".csv"), mode="w", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["x_min", "y_min", "x_max", "y_max", "score", "label", "peak_points"])
-                    for j in range(len(selected_results["scores"])):
-                        box = selected_results["boxes"][j]
-                        score = selected_results["scores"][j]
-                        label = selected_results["labels"][j]
-                        peak_points = json.dumps(peak_points_list[j])
-
-                        writer.writerow([box[0], box[1], box[2], box[3], score, label, peak_points])
-
-                if args.plot_figure:
-                    plot_das_predictions(
-                        images[i].cpu().numpy(),
-                        selected_results,
-                        os.path.join(figure_path, file_name + ".png"),
-                        args.min_prob
+    for panel_index, axis in enumerate(axes):
+        background = views[panel_index].T
+        low, high = np.percentile(background, (2, 98))
+        axis.imshow(
+            background,
+            cmap="seismic",
+            origin="lower",
+            aspect="auto",
+            vmin=low,
+            vmax=high,
+            rasterized=True,
+        )
+        for index in keep:
+            label = int(prediction["labels"][index])
+            channel_min, time_min, channel_max, time_max = (
+                float(value) for value in prediction["boxes"][index]
+            )
+            axis.add_patch(
+                Rectangle(
+                    (time_min, channel_min),
+                    time_max - time_min,
+                    channel_max - channel_min,
+                    fill=False,
+                    edgecolor="red",
+                    linewidth=1.5,
+                )
+            )
+            axis.text(
+                time_min + 20,
+                channel_max - 10,
+                f"Class {label}\n{scores[index]:.2f}",
+                color="white",
+                fontsize=8,
+            )
+            for stream_index, mask in enumerate(
+                active_mask_streams(prediction, index, args.mask_streams_by_category)
+            ):
+                display_mask = np.clip(mask.T, 0.0, 1.0)
+                rgba = plt.get_cmap(("Blues", "Greens", "Purples")[stream_index % 3])(
+                    display_mask
+                )
+                alpha = np.clip(
+                    (display_mask - args.plot_mask_threshold)
+                    / max(1e-6, 1.0 - args.plot_mask_threshold),
+                    0.0,
+                    1.0,
+                )
+                rgba[..., 3] = alpha * 0.75
+                axis.imshow(rgba, origin="lower", aspect="auto")
+                picks, _ = extract_picks(
+                    mask,
+                    prediction["boxes"][index],
+                    args.mask_threshold,
+                )
+                if picks:
+                    channels, times = zip(*picks)
+                    axis.scatter(
+                        times,
+                        channels,
+                        s=2,
+                        color=colors[stream_index % len(colors)],
                     )
-
-    if args.distributed:
-        torch.distributed.barrier()
-        dist.destroy_process_group()
-
-    return 0
-
-
-def main(args):
-    result_path = args.result_path
-    figure_path = os.path.join(result_path, f"figures_{args.model}")
-
-    os.makedirs(result_path, exist_ok=True)
-    os.makedirs(figure_path, exist_ok=True)
-
-    utils.init_distributed_mode(args)
-    print(args)
-
-    if args.distributed:
-        rank = utils.get_rank()
-        world_size = utils.get_world_size()
-    else:
-        rank, world_size = 0, 1
-
-    device = torch.device(args.device)
-    dtype = "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
-    ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
-    args.dtype, args.ptdtype = dtype, ptdtype
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-    if args.use_deterministic_algorithms:
-        torch.backends.cudnn.benchmark = False
-        torch.use_deterministic_algorithms(True)
-    else:
-        torch.backends.cudnn.benchmark = True
-
-    # if args.model in ["dasnet"]:...
-    dataset = DASNet__ContinuousDataset(
-        get_files(args.data_list),
-        key_path=args.key_path if hasattr(args, 'key_path') else None,
-        target_size=(1422, 6000),
-        pred_object=args.object,
-        channel_range=[7400, 10245]
+        axis.set_ylabel("Channel index")
+    axes[-1].set_xlabel("Time sample index")
+    figure.suptitle(os.path.basename(file_name))
+    figure.tight_layout()
+    os.makedirs(args.figure_dir, exist_ok=True)
+    figure.savefig(
+        os.path.join(args.figure_dir, f"{os.path.splitext(os.path.basename(file_name))[0]}.png"),
+        dpi=150,
     )
-    sampler = torch.utils.data.DistributedSampler(dataset) if args.distributed else None
+    plt.close(figure)
 
-    data_loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        sampler=sampler,
-        num_workers=min(args.workers, mp.cpu_count()),
-        collate_fn=None,
-        drop_last=False,
+
+def build_model(args):
+    """Construct a model matching the checkpoint configuration."""
+    anchor_sizes, anchor_metadata = resolve_rpn_anchor_sizes(
+        args.rpn_anchor_sizes,
+        auto=args.rpn_anchor_auto,
+        scales_blob=args.rpn_anchor_scales,
+        input_height=args.rpn_anchor_samples,
+        input_width=args.rpn_anchor_channels,
+        resize_scale=args.resize_scale,
+        transform_min_size=args.transform_min_size,
+        transform_max_size=args.transform_max_size,
     )
-
-    model = build_model( # eqnet.models.__dict__[args.model].build_model(
+    if anchor_metadata:
+        print(f"Resolved RPN anchor sizes: {anchor_metadata['anchor_sizes']}")
+    return build_dasnet_model(
         model_name="maskrcnn_resnet50_selectable_fpn",
-        num_classes=11,
+        num_classes=args.num_classes,
+        in_channels=args.image_channels,
         pretrained=False,
         pretrained_backbone=True,
         trainable_backbone_layers=3,
-        target_layer='P4',
+        target_layer="P4",
         box_roi_pool_size=7,
         mask_roi_pool_size=(42, 42),
-        rpn_pre_nms_top_n_train=2000,
-        rpn_pre_nms_top_n_test=1000,
-        rpn_post_nms_top_n_train=2000,
-        rpn_post_nms_top_n_test=1000,
-        box_positive_fraction=0.25,
-        max_size=6000,
-        min_size=1422
+        max_size=args.transform_max_size,
+        min_size=args.transform_min_size,
+        mask_prepare_mode=args.mask_prepare_mode,
+        arrival_band_alpha=args.arrival_band_alpha,
+        arrival_band_before_frac=args.arrival_band_before_frac,
+        arrival_band_after_frac=args.arrival_band_after_frac,
+        mask_streams_by_category=args.mask_streams_by_category,
+        use_learned_temporal_crop=args.use_learned_temporal_crop,
+        loss_temporal_crop_weight=args.loss_temporal_crop_weight,
+        temporal_crop_loss_divisor=args.temporal_crop_loss_divisor,
+        rpn_anchor_sizes=anchor_sizes,
+        rpn_anchor_aspect_ratios=args.rpn_anchor_aspect_ratios,
     )
-    logger.info("Model:\n{}".format(model))
 
-    model.to(device)
 
-    if args.resume:
-        print(f"Loading checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location="cpu")
-        model.load_state_dict(checkpoint["model"], strict=True)
-    else:
-        raise ("Missing pretrained model for this location")
-        # print(f"Loading pretrained model from: {args.model_path}")
-        # model.load_state_dict(torch.load(args.model_path, map_location="cpu"))
-
-    if args.distributed:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-        model = DDP(model, device_ids=[args.gpu])
-
+def main(args):
+    paths, names = read_input_paths(args.data_list, args.from_raw)
+    channel_range = (
+        (args.channel_start, args.channel_end) if args.from_raw else None
+    )
+    dataset = DASInferDataset(
+        paths,
+        resize_scale=args.resize_scale,
+        data_key="data",
+        data_is_strain_rate=True,
+        display_names=names,
+        image_channels=args.image_channels,
+        storage_backend=args.storage_backend,
+        gcs_key_path=args.gcs_key_path,
+        from_raw=args.from_raw,
+        channel_range=channel_range,
+        denoised_skip_preproc=args.denoised_skip_preproc,
+        denoised_apply_normalize=not args.denoised_no_normalize,
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        pin_memory=torch.cuda.is_available(),
+        collate_fn=collate_batch,
+    )
+    model = build_model(args).to(args.device)
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
-    pred_dasnet(args, model, data_loader, result_path, figure_path)
+    os.makedirs(args.output_dir, exist_ok=True)
+    if args.plot_figure:
+        args.figure_dir = args.figure_dir or os.path.join(args.output_dir, "figures")
+    autocast = nullcontext() if args.device == "cpu" else torch.amp.autocast("cuda")
+    with torch.inference_mode():
+        for images, file_names in loader:
+            with autocast:
+                outputs = model([image.to(args.device) for image in images])
+            for image, file_name, output in zip(images, file_names, outputs):
+                prediction = {
+                    key: value.detach().cpu().numpy()
+                    if isinstance(value, torch.Tensor)
+                    else [item.detach().cpu().numpy() for item in value]
+                    if isinstance(value, (list, tuple))
+                    and all(isinstance(item, torch.Tensor) for item in value)
+                    else value
+                    for key, value in output.items()
+                }
+                record = prediction_record(file_name, prediction, args)
+                if args.plot_figure:
+                    save_prediction_figure(file_name, image.cpu(), prediction, args)
+                output_path = os.path.join(
+                    args.output_dir, f"{os.path.splitext(os.path.basename(file_name))[0]}.json"
+                )
+                with open(output_path, "w", encoding="utf-8") as file:
+                    json.dump(record, file, indent=2)
 
-import argparse
-def get_args_parser(add_help=True):
-    parser = argparse.ArgumentParser(description="DASNet Mask R-CNN Inference", add_help=add_help)
 
-    # **Model-related parameters**
-    parser.add_argument("--model", default="dasnet", type=str, help="Model name")
-    # parser.add_argument("--model_path", type=str, default="", help="Path to the pre-trained model (.pth file)")
-    parser.add_argument("--resume", default="", type=str, help="Path to checkpoint for resuming inference")
-
-    # **Device & computation**
-    parser.add_argument("--device", default="cuda", type=str, help="Device to use: cuda / cpu")
-    parser.add_argument("--batch_size", default=1, type=int, help="Batch size per GPU")
-    parser.add_argument("--workers", default=4, type=int, help="Number of data loading workers")
-    parser.add_argument("--amp", action="store_true", help="Enable AMP (Automatic Mixed Precision) inference")
-
-    # **Distributed inference**
-    parser.add_argument("--distributed", action="store_true", help="Enable distributed inference")
-    parser.add_argument("--world-size", default=1, type=int, help="Number of distributed processes")
-    parser.add_argument("--dist-url", default="env://", type=str, help="URL for setting up distributed inference")
-
-    # **Data input**
-    parser.add_argument("--data_list", type=str, default="", help="CSV file with the path of the input data")
-    parser.add_argument("--object", type=str, default="default", help="Specify target files for inference (default: all)")
-    parser.add_argument("--key_path", type=str, default="", help="Path to the GCS access key (if using Google Cloud data)")
-
-    # **Prediction settings**
-    parser.add_argument("--result_path", type=str, default="results", help="Path to save inference results")
-    parser.add_argument("--min_prob", default=0.5, type=float, help="Confidence threshold (predictions below this value will be discarded)")
-    parser.add_argument("--plot_figure", action="store_true", help="Save prediction visualization images")
-
-    # **DAS-specific settings**
-    # parser.add_argument("--nt", default=4000, type=int, help="Number of time samples")
-    # parser.add_argument("--nx", default=948, type=int, help="Number of spatial samples")
-    # parser.add_argument("--cut_patch", action="store_true", help="Enable patching for continuous data")
-    parser.add_argument("--skip_existing", action="store_true", help="Skip processing files that already have results")
-
+def get_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", required=True, help="Path to a training checkpoint.")
+    parser.add_argument("--data-list", required=True, help="CSV containing input file paths.")
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--num-classes", required=True, type=int)
+    parser.add_argument("--image-channels", choices=(1, 3), type=int, default=1)
     parser.add_argument(
-        "--use-deterministic-algorithms", action="store_true", help="Forces the use of deterministic algorithms only."
+        "--from-raw",
+        action="store_true",
+        help="Read raw Acquisition/Raw[0]/RawData HDF5 input and compute strain rate.",
     )
-
+    parser.add_argument("--channel-start", type=int, help="First raw channel, inclusive.")
+    parser.add_argument("--channel-end", type=int, help="Last raw channel, exclusive.")
+    parser.add_argument(
+        "--storage-backend",
+        choices=("auto", "local", "gcs"),
+        default="auto",
+        help="Storage backend for standard or raw HDF5 files.",
+    )
+    parser.add_argument("--gcs-key-path", help="Optional service-account key for GCS input.")
+    parser.add_argument(
+        "--denoised-skip-preproc",
+        action="store_true",
+        help="Use the HDF5 data field directly instead of strain-rate filtering.",
+    )
+    parser.add_argument(
+        "--denoised-no-normalize",
+        action="store_true",
+        help="Do not normalize data when --denoised-skip-preproc is set.",
+    )
+    parser.add_argument("--resize-scale", type=float, default=1.0)
+    parser.add_argument("--transform-min-size", type=int, default=2048)
+    parser.add_argument("--transform-max-size", type=int, default=4096)
+    parser.add_argument("--mask-streams-by-class", default="")
+    parser.add_argument(
+        "--mask-prepare-mode",
+        choices=("fixed_crop", "attention_gate", "attention_plus_crop", "arrival_band"),
+        default="fixed_crop",
+        help="Mask-branch mode used during training.",
+    )
+    parser.add_argument("--use-learned-temporal-crop", action="store_true")
+    parser.add_argument("--loss-temporal-crop-weight", type=float, default=1.0)
+    parser.add_argument("--temporal-crop-loss-divisor", type=float, default=1000.0)
+    parser.add_argument("--arrival-band-alpha", type=float, default=1.0)
+    parser.add_argument("--arrival-band-before-frac", type=float, default=0.5)
+    parser.add_argument("--arrival-band-after-frac", type=float, default=0.5)
+    parser.add_argument("--rpn-anchor-sizes", default="")
+    parser.add_argument("--rpn-anchor-aspect-ratios", default="")
+    parser.add_argument("--rpn-anchor-auto", action="store_true")
+    parser.add_argument("--rpn-anchor-scales", default="0.125,0.25,0.5,1,1")
+    parser.add_argument("--rpn-anchor-samples", type=int, default=4096)
+    parser.add_argument("--rpn-anchor-channels", type=int, default=2048)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=0)
+    parser.add_argument("--min-probability", type=float, default=0.3)
+    parser.add_argument("--mask-threshold", type=float, default=0.5)
+    parser.add_argument("--plot-figure", action="store_true", help="Save prediction overlays as PNG files.")
+    parser.add_argument("--figure-dir", help="Directory for prediction figures.")
+    parser.add_argument("--plot-mask-threshold", type=float, default=0.25)
+    parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     return parser
 
 
 if __name__ == "__main__":
-    args = get_args_parser().parse_args()
-    main(args)
+    arguments = get_parser().parse_args()
+    arguments.mask_streams_by_category = parse_mask_streams(arguments.mask_streams_by_class)
+    arguments.rpn_anchor_sizes = parse_anchor_sizes(arguments.rpn_anchor_sizes)
+    arguments.rpn_anchor_aspect_ratios = parse_anchor_ratios(arguments.rpn_anchor_aspect_ratios)
+    if arguments.rpn_anchor_auto and arguments.rpn_anchor_sizes is not None:
+        raise SystemExit("Specify either --rpn-anchor-sizes or --rpn-anchor-auto.")
+    if arguments.from_raw:
+        if arguments.channel_start is None or arguments.channel_end is None:
+            raise SystemExit("--from-raw requires --channel-start and --channel-end.")
+        if arguments.channel_end <= arguments.channel_start:
+            raise SystemExit("--channel-end must be greater than --channel-start.")
+    main(arguments)

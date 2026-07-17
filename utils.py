@@ -40,24 +40,34 @@ class SmoothedValue:
 
     @property
     def median(self):
+        if not self.deque:
+            return 0.0
         d = torch.tensor(list(self.deque))
         return d.median().item()
 
     @property
     def avg(self):
+        if not self.deque:
+            return 0.0
         d = torch.tensor(list(self.deque), dtype=torch.float32)
         return d.mean().item()
 
     @property
     def global_avg(self):
+        if self.count == 0:
+            return 0.0
         return self.total / self.count
 
     @property
     def max(self):
+        if not self.deque:
+            return 0.0
         return max(self.deque)
 
     @property
     def value(self):
+        if not self.deque:
+            return 0.0
         return self.deque[-1]
 
     def __str__(self):
@@ -281,10 +291,16 @@ def init_distributed_mode(args):
         torch.cuda.set_device(args.gpu)
         args.dist_backend = "nccl"
         print(f"| distributed init (rank {args.rank}): {args.dist_url}", flush=True)
+        timeout_minutes = getattr(args, "dist_timeout_minutes", 120)
+        device = torch.device(f"cuda:{args.gpu}")
         torch.distributed.init_process_group(
-            backend=args.dist_backend, init_method=args.dist_url, world_size=args.world_size, rank=args.rank
+            backend=args.dist_backend,
+            init_method=args.dist_url,
+            world_size=args.world_size,
+            rank=args.rank,
+            timeout=datetime.timedelta(minutes=timeout_minutes),
+            device_id=device,
         )
-        torch.distributed.barrier()
         setup_for_distributed(args.rank == 0)
 
 

@@ -1,485 +1,444 @@
-import torch
-import time
-import math
-import wandb
-import os
-from contextlib import nullcontext
-import utils
-import datetime
-import torch.optim as optim
-from torch.utils.data import DataLoader, DistributedSampler
-from dasnet.data.seafoam_dataset import DASNet__SeaFOAMDataset
-from dasnet.model.dasnet_maskrcnn import maskrcnn_resnet50_fpn_dasnet, MaskRCNNPredictor
-from dasnet.model.dasnet import build_model
-import logging
+"""Train DASNet on local HDF5 data and COCO annotations."""
+
+from __future__ import annotations
+
 import argparse
-# TODO: add evaluate function for detection and measurement
+import datetime
+import json
+import math
+import os
+import time
+from contextlib import nullcontext
 
-logger = logging.getLogger("DASNet")
+import torch
+from torch.optim import AdamW
+from torch.utils.data import DataLoader, DistributedSampler
 
-def evaluate(model, data_loader, scaler, args, epoch=0, total_samples=1):
+import utils
+from dasnet.data.das import DASTrainDataset
+from dasnet.data.das_crop import DASCropTrainDataset
+from dasnet.model.dasnet import build_model
+from dasnet.model.rpn_anchor_config import resolve_rpn_anchor_sizes
+
+
+def load_bins_config(path: str) -> tuple[dict[int, tuple[int, int]], dict[int, int]]:
+    """Load optional SNR-bin filtering settings from a JSON file."""
+    with open(path, encoding="utf-8") as file:
+        config = json.load(file)
+    allowed = {
+        int(category): tuple(bounds)
+        for category, bounds in config.get("allowed_bins", {}).items()
+    }
+    minimum = {
+        int(category): int(value)
+        for category, value in config.get("min_keep_bins", {}).items()
+    }
+    return allowed, minimum
+
+
+def parse_anchor_sizes(value: str):
+    """Parse comma-separated RPN anchor sizes, optionally grouped by semicolon."""
+    groups = [group.strip() for group in value.split(";") if group.strip()]
+    if not groups:
+        return None
+    parsed = [
+        tuple(int(item.strip()) for item in group.split(",") if item.strip())
+        for group in groups
+    ]
+    if any(not group or any(item <= 0 for item in group) for group in parsed):
+        raise ValueError("RPN anchor sizes must be positive integers.")
+    return tuple((item,) for item in parsed[0]) if len(parsed) == 1 else tuple(parsed)
+
+
+def parse_anchor_ratios(value: str):
+    """Parse semicolon-separated groups of positive RPN aspect ratios."""
+    groups = [group.strip() for group in value.split(";") if group.strip()]
+    if not groups:
+        return None
+    parsed = tuple(
+        tuple(float(item.strip()) for item in group.split(",") if item.strip())
+        for group in groups
+    )
+    if any(not group or any(item <= 0 for item in group) for group in parsed):
+        raise ValueError("RPN aspect ratios must be positive.")
+    return parsed
+
+
+def parse_mask_streams(value: str) -> dict[int, int]:
+    """Parse category-to-mask-stream mappings such as ``1:2,2:1``."""
+    streams = {}
+    for item in (part.strip() for part in value.split(",")):
+        if not item:
+            continue
+        try:
+            category, count = item.split(":", 1)
+            streams[int(category)] = int(count)
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid mask stream mapping {item!r}; use category:count."
+            ) from error
+    if any(count < 1 for count in streams.values()):
+        raise ValueError("Mask-stream counts must be positive.")
+    return streams
+
+
+def collate_batch(batch):
+    return tuple(zip(*batch))
+
+
+def learning_rate_lambda(step: int, max_lr: float, min_lr: float, warmup: int, total: int) -> float:
+    """Return a warm-up followed by cosine-decay learning rate."""
+    if warmup and step < warmup:
+        return ((max_lr - min_lr) * step / warmup + min_lr) / max_lr
+    if step >= total:
+        return min_lr / max_lr
+    ratio = (step - warmup) / max(total - warmup, 1)
+    value = min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * ratio))
+    return value / max_lr
+
+
+def move_targets(targets, device):
+    """Move tensor fields in a target batch to the selected device."""
+    return [
+        {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in target.items()}
+        for target in targets
+    ]
+
+
+def make_loss_logger():
+    logger = utils.MetricLogger(delimiter="  ")
+    logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
+    logger.add_meter("loss", utils.SmoothedValue(window_size=20, fmt="{value:.6f}"))
+    return logger
+
+
+def train_epoch(model, loader, optimizer, scheduler, scaler, epoch, args):
+    """Run one optimization epoch."""
     model.train()
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter("loss", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
-
-    loss_keys = ['loss_classifier', 'loss_box_reg', 'loss_mask', 'loss_objectness', 'loss_rpn_box_reg']
-    for key in loss_keys:
-        metric_logger.add_meter(key, utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
-
-    header = "Eval:"
-    processed_samples = 0
-
-    with torch.inference_mode():
-        for images, targets in metric_logger.log_every(data_loader, args.print_freq, header):
-            images = [img.to(args.device) for img in images]
-            targets = [{k: v.to(args.device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
-
-            loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
-
-            batch_size = len(images)
-            metric_logger.update(loss=losses.item())
-
-            for key in loss_keys:
-                if key in loss_dict:
-                    metric_logger.update(**{key: loss_dict[key].item()})
-
-            processed_samples += batch_size
-            if processed_samples >= total_samples:
-                break
-
-    metric_logger.synchronize_between_processes()
-    print(f"Test Loss: {metric_logger.loss.global_avg:.6f}")
-
-    if args.wandb and utils.is_main_process():
-        wandb.log({
-            "test/loss": metric_logger.loss.global_avg,
-            "test/epoch": epoch,
-            **{f"test/{key}": metric_logger.meters[key].global_avg for key in loss_keys if key in metric_logger.meters}
-        })
-
-    del images, targets, loss_dict
-
-    return metric_logger
-
-def train_one_epoch(
-    model, 
-    optimizer, 
-    lr_scheduler, 
-    data_loader,
-    model_ema,
-    epoch, 
-    accumulation_steps,
-    scaler, 
-    total_samples,
-    args
-):
-    model.train()
-    metric_logger = utils.MetricLogger(delimiter="  ")
-    metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
-    metric_logger.add_meter("loss", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
-
-    # Mask R-CNN loss components
-    loss_keys = ['loss_classifier', 'loss_box_reg', 'loss_mask', 'loss_objectness', 'loss_rpn_box_reg']
-    for key in loss_keys:
-        metric_logger.add_meter(key, utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
-
-    header = f"Epoch: [{epoch}]"
-    ctx = (
-        nullcontext() 
-        if args.device in ["cpu", "mps"] 
-        else torch.amp.autocast(device_type=args.device, dtype=args.ptdtype)
+    logger = make_loss_logger()
+    optimizer.zero_grad(set_to_none=True)
+    autocast = (
+        nullcontext()
+        if args.device == "cpu"
+        else torch.amp.autocast(device_type="cuda", dtype=args.amp_dtype)
     )
 
-    processed_samples = 0
-    optimizer.zero_grad()
-    for batch_idx, (images, targets) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
+    for step, (images, targets) in enumerate(
+        logger.log_every(loader, args.print_freq, f"Epoch [{epoch}]")
+    ):
+        images = [image.to(args.device) for image in images]
+        targets = move_targets(targets, args.device)
+        with autocast:
+            losses = sum(model(images, targets).values())
 
-        # meta = {
-        #     "data": [img.to(args.device) for img in images],
-        #     "targets": [{k: v.to(args.device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
-        # }
-        targets = [{k: v.to(args.device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
-        images = [img.to(args.device) for img in images]
-        with ctx:
-            # loss_dict = model(meta)
-            loss_dict = model(images, targets)
-            losses = sum(loss for loss in loss_dict.values())
-        
-        if scaler is not None:
-            scaler.scale(losses).backward()
+        if not torch.isfinite(losses):
+            raise RuntimeError(f"Non-finite training loss: {losses.item()}")
+        scaled_loss = losses / args.accumulation_steps
+        if scaler is None:
+            scaled_loss.backward()
         else:
-            losses.backward()
-        
-        if (batch_idx + 1) % accumulation_steps == 0 or processed_samples + len(images) >= total_samples:
+            scaler.scale(scaled_loss).backward()
+
+        if (step + 1) % args.accumulation_steps == 0 or step + 1 == len(loader):
             if scaler is not None:
                 scaler.unscale_(optimizer)
-            if args.clip_value is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=args.clip_value)
-
-            if scaler is not None:
+            if args.clip_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
+            if scaler is None:
+                optimizer.step()
+            else:
                 scaler.step(optimizer)
                 scaler.update()
-            else:
-                optimizer.step()
-
-            optimizer.zero_grad()
-            lr_scheduler.step()
-
-        if model_ema is not None and batch_idx % args.model_ema_steps == 0:
-            model_ema.update_parameters(model)
-            if epoch < args.lr_warmup_epochs:
-                model_ema.n_averaged.fill_(0)
-
-        # batch_size = len(meta["data"])
-        metric_logger.update(loss=losses.item(), lr=optimizer.param_groups[0]["lr"])
-
-        # if args.model in ["dasnet"]:...   
-        for key in loss_keys:
-            if key in loss_dict:
-                metric_logger.update(**{key: loss_dict[key].item()})
-
-        # clear CUDA caches
-        # if (batch_idx + 1) % 50 == 0:
-        #     torch.cuda.empty_cache()
-
-        if args.wandb and utils.is_main_process():
-            log_data = {
-                "train/loss": losses.item(),
-                "train/lr": optimizer.param_groups[0]["lr"],
-                "train/epoch": epoch,
-                "train/batch": batch_idx,
-            }
-
-            # if args.model in ["dasnet"]:...  
-            for key in loss_keys:
-                if key in loss_dict:
-                    log_data[f"train/{key}"] = loss_dict[key].item()
-            wandb.log(log_data)
-
-        processed_samples += sum(img.shape[0] for img in images) # batch_size
-        if processed_samples >= total_samples:
-            break
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+        logger.update(loss=losses.item(), lr=optimizer.param_groups[0]["lr"])
+    logger.synchronize_between_processes()
 
 
-# data augmentationL streching
-import torchvision.transforms.functional as TF
-def resize_sample(image, target, output_size):
-    orig_h, orig_w = image.shape[1:]
-    new_h, new_w = output_size
-
-    scale_y = new_h / orig_h
-    scale_x = new_w / orig_w
-
-    # Resize image
-    image = TF.resize(image, output_size)
-
-    # Resize masks
-    if 'masks' in target:
-        target['masks'] = TF.resize(target['masks'], output_size)
-
-    # Resize attention masks
-    if 'attention_masks' in target:
-        target['attention_masks'] = TF.resize(target['attention_masks'], output_size)
-
-    # Scale boxes
-    if 'boxes' in target:
-        boxes = target['boxes'].clone()
-        boxes[:, [0, 2]] *= scale_x  # x1, x2
-        boxes[:, [1, 3]] *= scale_y  # y1, y2
-        target['boxes'] = boxes
-
-    # Scale area
-    if 'area' in target:
-        target['area'] = target['area'] * (scale_x * scale_y)
-
-    return image, target
+@torch.inference_mode()
+def validate(model, loader, args):
+    """Compute validation loss without modifying model parameters."""
+    model.train()
+    logger = make_loss_logger()
+    for images, targets in logger.log_every(loader, args.print_freq, "Validation"):
+        images = [image.to(args.device) for image in images]
+        targets = move_targets(targets, args.device)
+        losses = sum(model(images, targets).values())
+        logger.update(loss=losses.item())
+    logger.synchronize_between_processes()
+    return logger.loss.global_avg
 
 
-# def collate_fn_coco(batch):
-#     return tuple(zip(*batch))
-import random
-def collate_fn_coco(batch, resize=False):
-    images = []
-    targets = []
-    resize_h_factor = random.uniform(0.8, 1.1)
-    resize_w_factor = random.uniform(0.6, 1.1)
-    output_size = (
-        int(1422 * resize_h_factor),
-        int(6000 * resize_w_factor)
+def build_datasets(args):
+    """Build train and validation datasets using the original HDF5 readers."""
+    allowed_bins, min_keep_bins = (
+        load_bins_config(args.allowed_bins_json)
+        if args.allowed_bins_json
+        else ({}, {})
     )
-    for image, target in batch:
-        if resize:
-            image, target = resize_sample(image, target, output_size)
-        images.append(image)
-        targets.append(target)
-
-    return images, targets
-
-
-
-def get_lr(it, max_lr, min_lr, warmup_steps, max_steps):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_steps:
-        # return max_lr * (it+1) / warmup_steps + min_lr
-        return (max_lr - min_lr) * it / warmup_steps + min_lr
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > max_steps:
-        return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))  # coeff starts at 1 and goes to 0
-    return min_lr + coeff * (max_lr - min_lr)
-
-
-def main(args):
-    if args.output_dir:
-        utils.mkdir(args.output_dir)
-        figure_dir = os.path.join(args.output_dir, "figures")
-        args.figure_dir = figure_dir
-        utils.mkdir(figure_dir)
-
-    utils.init_distributed_mode(args)
-    print(args)
-
-    if args.distributed:
-        rank = utils.get_rank()
-        world_size = utils.get_world_size()
+    stream_options = {
+        "mask_streams_by_category": args.mask_streams_by_category or None,
+    }
+    crop_options = {
+        "crop_channels": args.crop_channels,
+        "crop_samples": args.crop_samples,
+        "resize_scale": args.resize_scale,
+        "image_channels": args.image_channels,
+        "min_picks_anchor": args.min_picks_anchor,
+        "min_picks_keep": args.min_picks_keep,
+    }
+    if args.use_crop_dataset:
+        train = DASCropTrainDataset(
+            ann_path=args.anno_path,
+            root_dir=args.data_path,
+            allowed_bins=allowed_bins,
+            min_keep_bins=min_keep_bins,
+            synthetic_noise=bool(args.noise_csv),
+            noise_csv=args.noise_csv,
+            enable_vflip=True,
+            **crop_options,
+            **stream_options,
+        )
+        validation = DASCropTrainDataset(
+            ann_path=args.val_anno_path,
+            root_dir=args.val_data_path,
+            synthetic_noise=False,
+            enable_vflip=False,
+            **crop_options,
+            **stream_options,
+        )
     else:
-        rank, world_size = 0, 1
+        if args.image_channels != 3:
+            raise ValueError("Full-segment training requires --image-channels 3.")
+        train = DASTrainDataset(
+            ann_path=args.anno_path,
+            root_dir=args.data_path,
+            allowed_bins=allowed_bins,
+            min_keep_bins=min_keep_bins,
+            resize_scale=args.resize_scale,
+            synthetic_noise=bool(args.noise_csv),
+            noise_csv=args.noise_csv,
+            enable_vflip=True,
+            **stream_options,
+        )
+        validation = DASTrainDataset(
+            ann_path=args.val_anno_path,
+            root_dir=args.val_data_path,
+            resize_scale=args.resize_scale,
+            synthetic_noise=False,
+            enable_vflip=False,
+            **stream_options,
+        )
+    return train, validation
 
-    torch.manual_seed(402 + rank)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(402 + rank)
 
-    device = torch.device(args.device)
-    dtype = "bfloat16" if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "float16"
-    ptdtype = {"float32": torch.float32, "bfloat16": torch.bfloat16, "float16": torch.float16}[dtype]
-    scaler = torch.cuda.amp.GradScaler(enabled=((dtype == "float16") & torch.cuda.is_available()))
-    args.dtype, args.ptdtype = dtype, ptdtype
-
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-
-    if args.use_deterministic_algorithms:
-        torch.backends.cudnn.benchmark = False
-        torch.use_deterministic_algorithms(True)
-    else:
-        torch.backends.cudnn.benchmark = True
-
-    # if args.model in ["dasnet"]:...  
-    dataset = DASNet__SeaFOAMDataset(
-        ann_path=args.anno_path,
-        root_dir=args.data_path,
-        device=device,
-        target_size=(1422, 6000),
-        synthetic_noise=False
+def build_dataloaders(train_dataset, validation_dataset, args):
+    """Build local or distributed data loaders."""
+    train_sampler = DistributedSampler(train_dataset) if args.distributed else None
+    validation_sampler = (
+        DistributedSampler(validation_dataset, shuffle=False) if args.distributed else None
     )
-    dataset_test = DASNet__SeaFOAMDataset(
-        ann_path=args.val_anno_path,
-        root_dir=args.val_data_path,
-        device=device
-    )
-
-    train_sampler = DistributedSampler(dataset) if args.distributed else None
-    test_sampler = DistributedSampler(dataset_test, shuffle=False) if args.distributed else None
-
-    data_loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
+    options = {
+        "batch_size": args.batch_size,
+        "num_workers": args.workers,
+        "pin_memory": torch.cuda.is_available(),
+        "collate_fn": collate_batch,
+    }
+    train_loader = DataLoader(
+        train_dataset,
         sampler=train_sampler,
-        num_workers=args.workers,
-        pin_memory=True,
-        collate_fn=lambda batch: collate_fn_coco(batch, resize=True),
-        drop_last=True
+        drop_last=True,
+        **options,
     )
-    data_loader_test = DataLoader(
-        dataset_test,
-        batch_size=args.batch_size,
-        sampler=test_sampler,
-        num_workers=args.workers,
-        pin_memory=True,
-        collate_fn=collate_fn_coco
+    validation_loader = DataLoader(
+        validation_dataset,
+        sampler=validation_sampler,
+        drop_last=False,
+        **options,
     )
+    return train_loader, validation_loader, train_sampler
 
-    # build model
-    model = build_model( # eqnet.models.__dict__[args.model].build_model(
+
+def build_dasnet(args):
+    """Construct the training model from command-line configuration."""
+    anchor_sizes, anchor_metadata = resolve_rpn_anchor_sizes(
+        args.rpn_anchor_sizes,
+        auto=args.rpn_anchor_auto,
+        scales_blob=args.rpn_anchor_scales,
+        input_height=args.crop_samples if args.use_crop_dataset else None,
+        input_width=args.crop_channels if args.use_crop_dataset else None,
+        resize_scale=args.resize_scale,
+        transform_min_size=args.transform_min_size,
+        transform_max_size=args.transform_max_size,
+    )
+    if anchor_metadata and utils.is_main_process():
+        print(f"Resolved RPN anchor sizes: {anchor_metadata['anchor_sizes']}")
+    return build_model(
         model_name="maskrcnn_resnet50_selectable_fpn",
-        num_classes=11,
+        num_classes=args.num_classes,
+        in_channels=args.image_channels,
         pretrained=False,
         pretrained_backbone=True,
         trainable_backbone_layers=3,
-        target_layer='P4',
+        target_layer="P4",
         box_roi_pool_size=7,
         mask_roi_pool_size=(42, 42),
-        rpn_pre_nms_top_n_train=2000,
-        rpn_pre_nms_top_n_test=1000,
-        rpn_post_nms_top_n_train=2000,
-        rpn_post_nms_top_n_test=1000,
-        box_positive_fraction=0.25,
-        max_size=6000,
-        min_size=1422
+        max_size=args.transform_max_size,
+        min_size=args.transform_min_size,
+        mask_prepare_mode="fixed_crop",
+        arrival_band_alpha=args.arrival_band_alpha,
+        arrival_band_before_frac=args.arrival_band_before_frac,
+        arrival_band_after_frac=args.arrival_band_after_frac,
+        mask_streams_by_category=args.mask_streams_by_category,
+        use_learned_temporal_crop=args.use_learned_temporal_crop,
+        loss_temporal_crop_weight=args.loss_temporal_crop_weight,
+        temporal_crop_loss_divisor=args.temporal_crop_loss_divisor,
+        rpn_anchor_sizes=anchor_sizes,
+        rpn_anchor_aspect_ratios=args.rpn_anchor_aspect_ratios,
     )
-    logger.info("Model:\n{}".format(model))
 
-    print("Model:\n{}".format(model))
 
-    total_params = 0
-    print("Trainable parameters in the model:")
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            num_params = param.numel()
-            total_params += num_params
-            print(f"{name}: {param.shape}, {num_params}")
-    print(f"Total number of trainable parameters: {total_params}")
+def save_checkpoint(path, model, optimizer, scheduler, epoch, args):
+    """Save all state required to resume training or run inference."""
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "lr_scheduler": scheduler.state_dict(),
+            "epoch": epoch,
+            "args": args,
+        },
+        path,
+    )
 
-    model.to(device)
 
-    if args.distributed and args.sync_bn:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+def main(args):
+    utils.init_distributed_mode(args)
+    os.makedirs(args.output_dir, exist_ok=True)
+    torch.manual_seed(args.seed + utils.get_rank())
+    device = torch.device(args.device)
+    args.amp_dtype = (
+        torch.bfloat16
+        if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        else torch.float16
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=args.device == "cuda" and args.amp_dtype == torch.float16)
 
+    train_dataset, validation_dataset = build_datasets(args)
+    train_loader, validation_loader, train_sampler = build_dataloaders(
+        train_dataset, validation_dataset, args
+    )
+    model = build_dasnet(args).to(device)
+    model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
         model_without_ddp = model.module
-    else:
-        model_without_ddp = model
 
-    optimizer = optim.AdamW(model.parameters(), lr=1.0, weight_decay=args.weight_decay)
-
-    # lr_scheduler
-    iters_per_epoch = len(data_loader)
-    warmup_steps = args.lr_warmup_epochs * iters_per_epoch
-    max_lr = args.lr
-    min_lr = args.lr * args.lr_min_ratio
-    max_steps = args.epochs * iters_per_epoch
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda it: get_lr(it, max_lr, min_lr, warmup_steps, max_steps)
+    optimizer = AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    total_steps = max(1, args.epochs * len(train_loader))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda step: learning_rate_lambda(
+            step,
+            args.learning_rate,
+            args.learning_rate * args.min_learning_rate_ratio,
+            args.warmup_epochs * len(train_loader),
+            total_steps,
+        ),
     )
-
-    # load checkpoint
+    start_epoch = 0
     if args.resume:
-        if args.checkpoint and os.path.exists(args.checkpoint):
-            print(f"Loading checkpoint from {args.checkpoint}")
-            checkpoint = torch.load(args.checkpoint, map_location="cpu")
-            model_without_ddp.load_state_dict(checkpoint["model"])
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-            args.start_epoch = checkpoint["epoch"] + 1
-            print(f"Resumed training from epoch {args.start_epoch}")
+        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
+        model_without_ddp.load_state_dict(checkpoint["model"])
+        optimizer.load_state_dict(checkpoint["optimizer"])
+        scheduler.load_state_dict(checkpoint["lr_scheduler"])
+        start_epoch = checkpoint["epoch"] + 1
 
-    # initialize WandB
-    if args.wandb and utils.is_main_process():
-        wandb.init(project="DASNet", config=vars(args))
-        wandb.watch(model, log="all", log_freq=args.print_freq)
-
-    # training loop
-    start_time = time.time()
     best_loss = float("inf")
-
-    for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed and train_sampler is not None:
+    started = time.time()
+    for epoch in range(start_epoch, args.epochs):
+        if train_sampler:
             train_sampler.set_epoch(epoch)
-
-        tmp_time = time.time()
-        train_one_epoch(
-            model, 
-            optimizer, 
-            lr_scheduler, 
-            data_loader, 
-            None, 
-            epoch, 
-            args.accumulation_steps, 
-            scaler, 
-            len(dataset), 
-            args
-        )
-        print(f"Training time of epoch {epoch} of rank {rank}: {time.time() - tmp_time:.3f}")
-
-        # TODO: add evaluate function
-        test_metric_logger = evaluate(model, data_loader_test, scaler, args, epoch, len(data_loader_test))
-
-        # save checkpoint
-        if args.output_dir and utils.is_main_process():
-            checkpoint = {
-                "model": model_without_ddp.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "lr_scheduler": lr_scheduler.state_dict(),
-                "epoch": epoch,
-                "args": args,
-            }
-            torch.save(checkpoint, os.path.join(args.output_dir, f"model_{epoch}.pth"))
-            torch.save(checkpoint, os.path.join(args.output_dir, "checkpoint.pth"))
-
-            if test_metric_logger.loss.global_avg < best_loss:
-                best_loss = test_metric_logger.loss.global_avg
-                torch.save(checkpoint, os.path.join(args.output_dir, "model_best.pth"))
-
-                if args.wandb:
-                    best_model = wandb.Artifact("best_model", type="model")
-                    best_model.add_file(os.path.join(args.output_dir, "model_best.pth"))
-                    wandb.log_artifact(best_model)
-
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    print(f"Training completed in {total_time_str}")
-
-    if args.wandb and utils.is_main_process():
-        wandb.finish()
+        train_epoch(model, train_loader, optimizer, scheduler, scaler, epoch, args)
+        loss = validate(model, validation_loader, args)
+        if utils.is_main_process():
+            state_path = os.path.join(args.output_dir, "checkpoint.pth")
+            save_checkpoint(state_path, model_without_ddp, optimizer, scheduler, epoch, args)
+            if loss < best_loss:
+                best_loss = loss
+                save_checkpoint(
+                    os.path.join(args.output_dir, "model_best.pth"),
+                    model_without_ddp,
+                    optimizer,
+                    scheduler,
+                    epoch,
+                    args,
+                )
+            print(f"Validation loss: {loss:.6f}")
+    if utils.is_main_process():
+        duration = datetime.timedelta(seconds=int(time.time() - started))
+        print(f"Training completed in {duration}.")
 
 
-def get_args_parser(add_help=True):
-    parser = argparse.ArgumentParser(description="Mask R-CNN Training for DASNet", add_help=add_help)
-
-    # Dataset parameters
-    parser.add_argument("--data-path", default="./data", type=str, help="Path to the training dataset")
-    parser.add_argument("--anno-path", default="./annotations/train.json", type=str, help="Path to the training annotation file")
-    parser.add_argument("--val-data-path", default="./data", type=str, help="Path to the validation dataset")
-    parser.add_argument("--val-anno-path", default="./annotations/val.json", type=str, help="Path to the validation annotation file")
-
-    # Training parameters
-    parser.add_argument("--device", default="cuda", type=str, help="Device to use (cuda or cpu)")
-    parser.add_argument("-b", "--batch-size", default=8, type=int, help="Batch size per GPU (total batch size = batch_size * number of GPUs)")
-    parser.add_argument("--epochs", default=50, type=int, metavar="N", help="Total number of training epochs")
-    parser.add_argument("--workers", default=4, type=int, metavar="N", help="Number of data loading workers")
-
-    # Optimizer and learning rate settings
-    parser.add_argument("--opt", default="adamw", type=str, help="Optimizer type")
-    parser.add_argument("--lr", default=1e-4, type=float, help="Initial learning rate")
-    parser.add_argument("--weight-decay", default=1e-4, type=float, help="Weight decay (L2 regularization)")
-    parser.add_argument("--lr-warmup-epochs", default=1, type=int, help="Number of warm-up epochs for learning rate")
-    parser.add_argument("--lr-scheduler", default="cosineannealinglr", type=str, help="Learning rate scheduler type")
-    parser.add_argument("--lr-min-ratio", default=0.1, type=float, help="Minimum learning rate ratio relative to the initial LR")
-
-    # Training configurations
-    parser.add_argument("--accumulation-steps", default=1, type=int, help="Number of steps for gradient accumulation")
-    parser.add_argument("--clip-value", default=None, type=float, help="Gradient clipping threshold")
-
-    # WandB logging
-    parser.add_argument("--wandb", action="store_true", help="Enable WandB logging")
-    parser.add_argument("--wandb-project", default="DASNet", type=str, help="WandB project name")
-    parser.add_argument("--wandb-name", default=None, type=str, help="WandB run name")
-
-    # Checkpointing
-    parser.add_argument("--output-dir", default="./output", type=str, help="Directory to save model checkpoints")
-    parser.add_argument("--resume", action="store_true", help="Resume training from the latest checkpoint")
-    parser.add_argument("--checkpoint", default=None, type=str, help="Path to a checkpoint file")
-    parser.add_argument("--start-epoch", default=0, type=int, metavar="N", help="Starting epoch number")
-    parser.add_argument("--print-freq", default=10, type=int, help="print frequency")
-
-    # Distributed training parameters
-    parser.add_argument("--distributed", action="store_true", help="Enable distributed training")
-    parser.add_argument("--sync-bn", action="store_true", help="Use synchronized batch normalization")
-    parser.add_argument("--world-size", default=1, type=int, help="Number of distributed training processes")
-    parser.add_argument("--dist-url", default="env://", type=str, help="URL used for setting up distributed training")
-
+def get_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--data-path", required=True, help="Directory containing training HDF5 files.")
+    parser.add_argument("--anno-path", required=True, help="Training COCO annotation JSON.")
+    parser.add_argument("--val-data-path", required=True, help="Directory containing validation HDF5 files.")
+    parser.add_argument("--val-anno-path", required=True, help="Validation COCO annotation JSON.")
+    parser.add_argument("--output-dir", required=True, help="Directory for checkpoints.")
+    parser.add_argument("--num-classes", type=int, required=True, help="Class count including background.")
+    parser.add_argument("--image-channels", choices=(1, 3), type=int, default=3)
     parser.add_argument(
-        "--use-deterministic-algorithms", action="store_true", help="Forces the use of deterministic algorithms only."
+        "--use-crop-dataset",
+        action="store_true",
+        help="Read random windows from large HDF5 segments.",
     )
-
+    parser.add_argument("--crop-channels", type=int, default=2048)
+    parser.add_argument("--crop-samples", type=int, default=4096)
+    parser.add_argument("--min-picks-anchor", type=int, default=64)
+    parser.add_argument("--min-picks-keep", type=int, default=8)
+    parser.add_argument("--resize-scale", type=float, default=1.0)
+    parser.add_argument("--allowed-bins-json", help="Optional SNR-bin configuration JSON.")
+    parser.add_argument("--noise-csv", help="Optional CSV with a File Path column for noise augmentation.")
+    parser.add_argument("--mask-streams-by-class", default="", help="Mask stream counts, for example 1:2.")
+    parser.add_argument("--use-learned-temporal-crop", action="store_true")
+    parser.add_argument("--loss-temporal-crop-weight", type=float, default=1.0)
+    parser.add_argument("--temporal-crop-loss-divisor", type=float, default=1000.0)
+    parser.add_argument("--arrival-band-alpha", type=float, default=1.0)
+    parser.add_argument("--arrival-band-before-frac", type=float, default=0.5)
+    parser.add_argument("--arrival-band-after-frac", type=float, default=0.5)
+    parser.add_argument("--transform-min-size", type=int, default=2048)
+    parser.add_argument("--transform-max-size", type=int, default=4096)
+    parser.add_argument("--rpn-anchor-sizes", default="")
+    parser.add_argument("--rpn-anchor-aspect-ratios", default="")
+    parser.add_argument("--rpn-anchor-auto", action="store_true")
+    parser.add_argument("--rpn-anchor-scales", default="0.125,0.25,0.5,1,1")
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--warmup-epochs", type=int, default=1)
+    parser.add_argument("--min-learning-rate-ratio", type=float, default=0.1)
+    parser.add_argument("--accumulation-steps", type=int, default=1)
+    parser.add_argument("--clip-grad-norm", type=float)
+    parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
+    parser.add_argument("--resume", help="Checkpoint to resume.")
+    parser.add_argument("--print-freq", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=402)
+    parser.add_argument("--world-size", type=int, default=1)
+    parser.add_argument("--dist-url", default="env://")
     return parser
 
 
 if __name__ == "__main__":
-    args = get_args_parser().parse_args()
-    main(args)
+    arguments = get_parser().parse_args()
+    arguments.mask_streams_by_category = parse_mask_streams(arguments.mask_streams_by_class)
+    arguments.rpn_anchor_sizes = parse_anchor_sizes(arguments.rpn_anchor_sizes)
+    arguments.rpn_anchor_aspect_ratios = parse_anchor_ratios(arguments.rpn_anchor_aspect_ratios)
+    if arguments.rpn_anchor_auto and arguments.rpn_anchor_sizes is not None:
+        raise SystemExit("Specify either --rpn-anchor-sizes or --rpn-anchor-auto.")
+    if arguments.rpn_anchor_auto and not arguments.use_crop_dataset:
+        raise SystemExit("--rpn-anchor-auto requires --use-crop-dataset.")
+    main(arguments)

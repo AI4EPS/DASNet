@@ -14,7 +14,7 @@ from torchvision.models.detection._utils import overwrite_eps
 from torchvision.models.detection.backbone_utils import _validate_trainable_layers
 from torchvision.models.detection.mask_rcnn import MaskRCNNHeads, MaskRCNNPredictor, MaskRCNN_ResNet50_FPN_Weights
 from .backbone_utils import _resnet_customfpn_extractor, _resnet_fpn_extractor_shallow
-from .dasnet_fastrcnn import _default_anchorgen, DASNet__FastRCNN, RPNHead
+from .fastrcnn import _default_anchorgen, FastRCNN, RPNHead
 from torchvision.models.detection.faster_rcnn import FastRCNNConvFCHead
 
 
@@ -27,7 +27,7 @@ from torchvision.models.detection.faster_rcnn import FastRCNNConvFCHead
 # ]
 
 
-class DASNet__MaskRCNN(DASNet__FastRCNN):
+class MaskRCNN(FastRCNN):
     """
     Implements Mask R-CNN.
 
@@ -416,7 +416,7 @@ def maskrcnn_resnet50_fpn_dasnet(
     weights_backbone: Optional[ResNet50_Weights] = ResNet50_Weights.IMAGENET1K_V1,
     trainable_backbone_layers: Optional[int] = None,
     **kwargs: Any,
-) -> DASNet__MaskRCNN:
+) -> MaskRCNN:
     """DASNet model with a ResNet-50-FPN backbone from the `DASNet
     <https:>`_ paper.
 
@@ -502,7 +502,7 @@ def maskrcnn_resnet50_fpn_dasnet(
     backbone = resnet50(weights=weights_backbone, progress=progress, norm_layer=norm_layer)
     backbone = _resnet_fpn_extractor_shallow(backbone, trainable_backbone_layers)
     # backbone = _resnet_customfpn_extractor(backbone, trainable_backbone_layers)
-    model = DASNet__MaskRCNN(backbone, num_classes=num_classes, **kwargs)
+    model = MaskRCNN(backbone, num_classes=num_classes, **kwargs)
 
     if weights is not None:
         model.load_state_dict(weights.get_state_dict(progress=progress))

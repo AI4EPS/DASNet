@@ -3,16 +3,13 @@
 
 import os
 import random
-from typing import Optional
+from typing import Dict, FrozenSet, List, Optional, Tuple
 import h5py
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
-try:
-    from pycocotools.coco import COCO
-except ImportError:
-    COCO = None
+from pycocotools.coco import COCO
 from torchvision.transforms import functional as F
 from scipy.signal import butter, sosfiltfilt
 import fsspec
@@ -107,6 +104,76 @@ def filter_instances_by_min_bin(annotations, min_keep_bins):
             kept.append(ann)
 
     return kept
+
+
+# =========================================================
+# Raw MBARI HDF5 (Acquisition/Raw[0]/...)
+# =========================================================
+
+RAW_DATA_H5_PATH = "Acquisition/Raw[0]/RawData"
+RAW_DATA_TIME_H5_PATH = "Acquisition/Raw[0]/RawDataTime"
+
+
+def read_dt_from_rawdata_time(raw_data_time: np.ndarray) -> float:
+    """Compute sampling interval (s) from RawDataTime (typically microseconds)."""
+    das_time = raw_data_time.astype(np.float64) / 1e6
+    if das_time.shape[0] < 2:
+        raise ValueError("RawDataTime length < 2, cannot compute dt.")
+    dt = float(das_time[1] - das_time[0])
+    if dt <= 0:
+        raise ValueError(f"Invalid dt computed from RawDataTime: {dt}")
+    return dt
+
+
+def compute_strain_rate_nt_nch(strain_nt_nch: np.ndarray, dt: float) -> np.ndarray:
+    """strain (nt, nch) -> strain_rate (nt, nch) = d(strain)/dt along time."""
+    sr = np.diff(strain_nt_nch, axis=0) / dt
+    sr = np.vstack([np.zeros((1, sr.shape[1]), dtype=sr.dtype), sr])
+    return sr.astype(np.float32, copy=False)
+
+
+def _read_mbari_raw_arrays(
+    f: "h5py.File",
+    channel_start: int,
+    channel_end: int,
+) -> Tuple[np.ndarray, float]:
+    """Read raw strain (nt, nch) and dt from an open MBARI-style HDF5 file."""
+    raw_data = f[RAW_DATA_H5_PATH]
+    raw_data_time = f[RAW_DATA_TIME_H5_PATH][:]
+    strain = raw_data[:, channel_start:channel_end]
+    if strain.size == 0:
+        raise ValueError(
+            f"Empty strain after channel slice [{channel_start}:{channel_end}]"
+        )
+    dt = read_dt_from_rawdata_time(raw_data_time)
+    return strain, dt
+
+
+def load_mbari_raw_to_strain_rate_nch_nt(
+    h5_path: str,
+    channel_start: int,
+    channel_end: int,
+    storage_backend: str = "local",
+    gcs_key_path: Optional[str] = None,
+) -> Tuple[np.ndarray, float]:
+    """
+    Load MBARI raw HDF5 and return microstrain/s as (nch, nt) plus dt in seconds.
+
+    Matches the offline prep script: slice channels on RawData (nt, n_total_ch),
+    differentiate along time, transpose to (nch, nt).
+    """
+    if storage_backend == "gcs" or (isinstance(h5_path, str) and h5_path.startswith("gs://")):
+        fs = fsspec.filesystem("gcs", token=gcs_key_path)
+        with fs.open(h5_path, "rb") as fp:
+            with h5py.File(fp, "r") as f:
+                strain, dt = _read_mbari_raw_arrays(f, channel_start, channel_end)
+    else:
+        with h5py.File(h5_path, "r") as f:
+            strain, dt = _read_mbari_raw_arrays(f, channel_start, channel_end)
+
+    strain_rate = compute_strain_rate_nt_nch(strain, dt)
+    data = np.ascontiguousarray(strain_rate.T, dtype=np.float32)
+    return data, dt
 
 
 # =========================================================
@@ -210,6 +277,120 @@ def preprocess_data_rgb(
     return rgb, dt
 
 
+def preprocess_data_image(
+    h5_path: str,
+    channel_range=None,
+    data_key: str = "data",
+    data_is_strain_rate: bool = True,
+    f_band=(2.0, 10.0),
+    f_high=10.0,
+    storage_backend: str = "local",
+    gcs_key_path: Optional[str] = None,
+    image_channels: int = 3,
+):
+    """Read DAS H5 and return either strain-rate-only (1ch) or RGB-style (3ch) image."""
+    if image_channels == 3:
+        return preprocess_data_rgb(
+            h5_path,
+            channel_range=channel_range,
+            data_key=data_key,
+            data_is_strain_rate=data_is_strain_rate,
+            f_band=f_band,
+            f_high=f_high,
+            storage_backend=storage_backend,
+            gcs_key_path=gcs_key_path,
+        )
+    if image_channels != 1:
+        raise ValueError(f"Unsupported image_channels={image_channels}; expected 1 or 3")
+
+    if storage_backend == "gcs" or (isinstance(h5_path, str) and h5_path.startswith("gs://")):
+        fs = fsspec.filesystem("gcs", token=gcs_key_path)
+        with fs.open(h5_path, "rb") as fp:
+            with h5py.File(fp, "r") as f:
+                if data_key not in f:
+                    raise KeyError(f"'{data_key}' not found in {h5_path}. Keys={list(f.keys())}")
+                dset = f[data_key]
+                dt = float(dset.attrs.get("dt_s", None))
+                if dt is None:
+                    raise KeyError(f"dt_s attribute not found in {h5_path}:{data_key}")
+                raw = dset[:].astype("float32")
+    else:
+        with h5py.File(h5_path, "r") as f:
+            if data_key not in f:
+                raise KeyError(f"'{data_key}' not found in {h5_path}. Keys={list(f.keys())}")
+            dset = f[data_key]
+            dt = float(dset.attrs.get("dt_s", None))
+            if dt is None:
+                raise KeyError(f"dt_s attribute not found in {h5_path}:{data_key}")
+            raw = dset[:].astype("float32")
+
+    if channel_range is not None:
+        ch0, ch1 = channel_range
+        raw = raw[ch0:ch1, :]
+    if data_is_strain_rate:
+        strain_rate = raw
+    else:
+        sr = np.diff(raw, axis=1) / dt
+        strain_rate = np.concatenate([np.zeros((sr.shape[0], 1), dtype=sr.dtype), sr], axis=1)
+    ch = normalize(strain_rate.T).T
+    return ch[:, :, None].astype(np.float32), dt
+
+
+def preprocess_denoised_rgb_only(
+    h5_path: str,
+    channel_range=None,
+    data_key: str = "data",
+    storage_backend: str = "local",
+    gcs_key_path: Optional[str] = None,
+    apply_normalize: bool = True,
+) -> Tuple[np.ndarray, float]:
+    """
+    For HDF5 that already holds a denoised (or otherwise final) field map ``(nch, nt)`` under
+    ``data_key`` with ``attrs['dt_s']``: skip strain-rate / bandpass / highpass, then either:
+
+    - ``apply_normalize=True`` (default): same ``normalize()`` as RGB ch0 in ``preprocess_data_rgb``,
+      then stack that map three times.
+    - ``apply_normalize=False``: copy ``data`` float32 as-is three times (A/B vs extra z-score).
+
+    ``dt_s`` is still read and returned for downstream metadata; it is not used in processing.
+    """
+    if storage_backend == "gcs" or (isinstance(h5_path, str) and h5_path.startswith("gs://")):
+        fs = fsspec.filesystem("gcs", token=gcs_key_path)
+        with fs.open(h5_path, "rb") as fp:
+            with h5py.File(fp, "r") as f:
+                if data_key not in f:
+                    raise KeyError(f"'{data_key}' not found in {h5_path}. Keys={list(f.keys())}")
+                dset = f[data_key]
+                dt = float(dset.attrs.get("dt_s", None))
+                if dt is None:
+                    raise KeyError(f"dt_s attribute not found in {h5_path}:{data_key}")
+                raw = dset[:].astype("float32")
+    else:
+        with h5py.File(h5_path, "r") as f:
+            if data_key not in f:
+                raise KeyError(f"'{data_key}' not found in {h5_path}. Keys={list(f.keys())}")
+            dset = f[data_key]
+            dt = float(dset.attrs.get("dt_s", None))
+            if dt is None:
+                raise KeyError(f"dt_s attribute not found in {h5_path}:{data_key}")
+            raw = dset[:].astype("float32")
+
+    if channel_range is not None:
+        c0, c1 = channel_range
+        raw = raw[c0:c1, :]
+
+    raw = np.ascontiguousarray(raw, dtype=np.float32)
+    if apply_normalize:
+        ch = normalize(raw.T).T
+    else:
+        ch = raw
+    rgb = np.zeros((ch.shape[0], ch.shape[1], 3), dtype=np.float32)
+    rgb[:, :, 0] = ch
+    rgb[:, :, 1] = ch
+    rgb[:, :, 2] = ch
+    return rgb, dt
+
+
 def preprocess_from_array(
     data_nch_nt: np.ndarray,
     dt_s: float,
@@ -258,6 +439,36 @@ def preprocess_from_array(
     return rgb, dt_s
 
 
+def preprocess_from_array_image(
+    data_nch_nt: np.ndarray,
+    dt_s: float,
+    data_is_strain_rate: bool = True,
+    f_band=(2.0, 10.0),
+    f_high=10.0,
+    image_channels: int = 3,
+):
+    """Array variant of preprocess_data_image."""
+    if image_channels == 3:
+        return preprocess_from_array(
+            data_nch_nt,
+            dt_s,
+            data_is_strain_rate=data_is_strain_rate,
+            f_band=f_band,
+            f_high=f_high,
+        )
+    if image_channels != 1:
+        raise ValueError(f"Unsupported image_channels={image_channels}; expected 1 or 3")
+
+    raw = np.asarray(data_nch_nt, dtype=np.float32)
+    if data_is_strain_rate:
+        strain_rate = raw
+    else:
+        sr = np.diff(raw, axis=1) / dt_s
+        strain_rate = np.concatenate([np.zeros((sr.shape[0], 1), dtype=sr.dtype), sr], axis=1)
+    ch = normalize(strain_rate.T).T
+    return ch[:, :, None].astype(np.float32), dt_s
+
+
 # =========================================================
 # Training Dataset (full features)
 # =========================================================
@@ -271,7 +482,7 @@ class DASTrainDataset(Dataset):
     - event stacking
     - noise stacking
     - gaussian line mask generation
-    - attention_mask support
+    - confident_area (annotation ``confident_area`` or legacy ``attention_mask``) rasterized to ``confident_area_masks``
     - vertical flip augmentation
     - resize by fixed scale (not fixed size)
     - data is (C, W, H), H=channels-axis, W=time-axis in the intermediate RGB
@@ -314,6 +525,11 @@ class DASTrainDataset(Dataset):
         # gaussian mask params
         gaussian_std_dev_x: float = 50.0,
         gaussian_amplitude: float = 1.0,
+        # optional multi-stream masks (P/S/…): see doc/ATTENTION_DUAL_MASK.md
+        aux_mask_category_ids: Optional[Tuple[int, ...]] = None,
+        aux_segmentation_key: str = "segmentation_aux",
+        mask_streams_by_category: Optional[Dict[int, int]] = None,
+        mask_stream_json_keys: Optional[Tuple[str, ...]] = None,
     ):
         self.coco = COCO(ann_path)
         self.root_dir = root_dir
@@ -345,6 +561,39 @@ class DASTrainDataset(Dataset):
 
         self.gaussian_std_dev_x = gaussian_std_dev_x
         self.gaussian_amplitude = gaussian_amplitude
+
+        self.aux_mask_category_ids: Optional[FrozenSet[int]] = (
+            frozenset(int(x) for x in aux_mask_category_ids) if aux_mask_category_ids else None
+        )
+        self.aux_segmentation_key = aux_segmentation_key
+
+        if mask_streams_by_category:
+            self._msc: Dict[int, int] = {int(k): int(v) for k, v in mask_streams_by_category.items()}
+        elif self.aux_mask_category_ids:
+            self._msc = {int(c): 2 for c in self.aux_mask_category_ids}
+        else:
+            self._msc = {}
+        self.max_mask_streams_ds = max(1, max(self._msc.values()) if self._msc else 1)
+
+        if mask_stream_json_keys is not None:
+            self._stream_keys: Tuple[str, ...] = tuple(str(x) for x in mask_stream_json_keys)
+        elif self.max_mask_streams_ds <= 1:
+            self._stream_keys = ("segmentation",)
+        elif self.max_mask_streams_ds == 2:
+            self._stream_keys = ("segmentation", self.aux_segmentation_key)
+        else:
+            raise ValueError(
+                "max mask streams > 2 requires explicit mask_stream_json_keys (one COCO field per stream, e.g. "
+                "segmentation,segmentation_aux,custom_seg_2)."
+            )
+        if len(self._stream_keys) < self.max_mask_streams_ds:
+            raise ValueError(
+                f"mask_stream_json_keys length {len(self._stream_keys)} < max streams {self.max_mask_streams_ds}"
+            )
+        if self._msc and max(self._msc.values()) > len(self._stream_keys):
+            raise ValueError(
+                f"mask_streams_by_category max {max(self._msc.values())} exceeds len(mask_stream_json_keys)={len(self._stream_keys)}"
+            )
 
     def __len__(self):
         return len(self.ids)
@@ -460,22 +709,22 @@ class DASTrainDataset(Dataset):
         return rgb_aug
 
     # -----------------------------
-    # attention mask
+    # confident area (per-instance raster for loss / FPN gate)
     # -----------------------------
-    def _generate_attention_mask(self, attention_mask_rects, mask_shape, original_shape):
+    def _rasterize_confident_area_rects(self, rects, mask_shape, original_shape):
         """
-        attention_mask_rects: list of [x_min(time), y_min(channel), width(time), height(channel)]
+        rects: list of [x_min(time), y_min(channel), width(time), height(channel)]
         mask_shape: (new_t, new_ch) after resize  -> (time, channel)
         original_shape: (orig_t, orig_ch) before resize
         """
-        attention_mask = np.zeros(mask_shape, dtype=np.uint8)
+        out = np.zeros(mask_shape, dtype=np.uint8)
 
         orig_t, orig_ch = original_shape
         new_t, new_ch = mask_shape
         scale_t = new_t / max(orig_t, 1)
         scale_ch = new_ch / max(orig_ch, 1)
 
-        for rect in attention_mask_rects:
+        for rect in rects:
             x_min_t, y_min_ch, width_t, height_ch = rect
 
             t0 = int(x_min_t * scale_t)
@@ -489,9 +738,43 @@ class DASTrainDataset(Dataset):
             ch1 = min(new_ch, ch1)
 
             if t1 > t0 and ch1 > ch0:
-                attention_mask[t0:t1, ch0:ch1] = 1
+                out[t0:t1, ch0:ch1] = 1
 
-        return attention_mask
+        return out
+
+    def _generate_attention_mask(self, attention_mask_rects, mask_shape, original_shape):
+        """Deprecated alias for :meth:`_rasterize_confident_area_rects`."""
+        return self._rasterize_confident_area_rects(attention_mask_rects, mask_shape, original_shape)
+
+    def _gaussian_line_mask_u8(self, segs, new_h: int, new_w: int, scale_t: float, scale_ch: float) -> np.ndarray:
+        """Gaussian ridge mask (time × channel grid) from COCO-style polylines [t,ch,...]."""
+        mask = np.zeros((new_h, new_w), dtype=np.float32)
+        std_dev = self.gaussian_std_dev_x * scale_t
+        amplitude = float(self.gaussian_amplitude)
+
+        for seg in segs:
+            if len(seg) < 10:
+                continue
+            pts = []
+            for i in range(0, len(seg), 2):
+                t = seg[i]
+                ch = seg[i + 1]
+                x = int(ch * scale_ch)
+                y = int(t * scale_t)
+                pts.append((x, y))
+
+            pts = interpolate_line_segments_int(pts)
+            for x, y in pts:
+                if 0 <= x < new_w:
+                    mask[:, x] = np.maximum(mask[:, x], gaussian_line(y, std_dev, amplitude, new_h))
+
+        col_max = np.max(mask, axis=0) if mask.size else np.zeros((new_w,), dtype=np.float32)
+        cols = col_max > amplitude
+        if np.any(cols):
+            scales = col_max[cols] / amplitude
+            mask[:, cols] /= scales[None, :]
+
+        return (mask * 255).astype(np.uint8)
 
     # -----------------------------
     # main getitem
@@ -544,10 +827,12 @@ class DASTrainDataset(Dataset):
         # ===== build targets =====
         boxes = []
         labels = []
-        masks = []
-        attention_masks = []
+        confident_area_masks = []
         areas = []
         iscrowd = []
+
+        K = len(self._stream_keys)
+        stream_rows: List[List[np.ndarray]] = [[] for _ in range(K)]
 
         for ann in annotations:
             bbox = ann["bbox"]  # [x(time), y(channel), w(time), h(channel)]
@@ -566,84 +851,78 @@ class DASTrainDataset(Dataset):
             areas.append((bw * scale_t) * (bh * scale_ch))
             iscrowd.append(ann.get("iscrowd", 0))
 
-            # ===== gaussian line mask =====
-            mask = np.zeros((new_h, new_w), dtype=np.float32)  # (time, channel)
+            cat = int(ann["category_id"])
+            n_s = int(self._msc.get(cat, 1))
+            for k in range(K):
+                if k < n_s:
+                    key = self._stream_keys[k]
+                    raw = ann.get(key, [])
+                    segs = raw if isinstance(raw, list) else []
+                else:
+                    segs = []
+                stream_rows[k].append(self._gaussian_line_mask_u8(segs, new_h, new_w, scale_t, scale_ch))
 
-            std_dev = self.gaussian_std_dev_x * scale_t
-            amplitude = float(self.gaussian_amplitude)
-
-            segs = ann.get("segmentation", [])
-            for seg in segs:
-                if len(seg) < 10:
-                    continue
-
-                pts = []
-                for i in range(0, len(seg), 2):
-                    t = seg[i]
-                    ch = seg[i + 1]
-                    x = int(ch * scale_ch)
-                    y = int(t * scale_t)
-                    pts.append((x, y))
-
-                pts = interpolate_line_segments_int(pts)
-                for x, y in pts:
-                    if 0 <= x < new_w:
-                        # Keep only the strongest response per column to avoid
-                        # multi-peak accumulation around turning points.
-                        mask[:, x] = np.maximum(mask[:, x], gaussian_line(y, std_dev, amplitude, new_h))
-
-            col_max = np.max(mask, axis=0) if mask.size else np.zeros((new_w,), dtype=np.float32)
-            cols = col_max > amplitude
-            if np.any(cols):
-                scales = col_max[cols] / amplitude
-                mask[:, cols] /= scales[None, :]
-
-            mask_u8 = (mask * 255).astype(np.uint8)
-            masks.append(mask_u8)
-
-            # ===== attention_mask support =====
-            if "attention_mask" in ann:
-                att = self._generate_attention_mask(
-                    ann["attention_mask"],
+            # ===== confident_area (COCO: confident_area or legacy attention_mask) =====
+            rects = None
+            if "confident_area" in ann:
+                rects = ann["confident_area"]
+            elif "attention_mask" in ann:
+                rects = ann["attention_mask"]
+            if rects:
+                att = self._rasterize_confident_area_rects(
+                    rects,
                     mask_shape=(new_h, new_w),
                     original_shape=original_size_for_labels,  # (orig_W, orig_H)
                 )
             else:
                 att = np.zeros((new_h, new_w), dtype=np.uint8)
 
-            attention_masks.append(att)
+            confident_area_masks.append(att)
 
         # to tensors
         boxes = torch.as_tensor(boxes, dtype=torch.float32)
         labels = torch.as_tensor(labels, dtype=torch.int64)
-        masks = torch.stack([torch.tensor(m, dtype=torch.uint8) for m in masks])
-        attention_masks = torch.stack([torch.tensor(a, dtype=torch.uint8) for a in attention_masks])
+        n_inst = len(labels)
+        if n_inst == 0:
+            z = torch.zeros(0, new_h, new_w, dtype=torch.uint8)
+            mask_streams_t = tuple(z for _ in range(K))
+        else:
+            mask_streams_t = tuple(
+                torch.stack([torch.tensor(stream_rows[k][i], dtype=torch.uint8) for i in range(n_inst)])
+                for k in range(K)
+            )
+        masks = mask_streams_t[0]
+        confident_area_masks = torch.stack([torch.tensor(a, dtype=torch.uint8) for a in confident_area_masks])
         areas = torch.as_tensor(areas, dtype=torch.float32)
         iscrowd = torch.as_tensor(iscrowd, dtype=torch.int64)
 
-        # ===== vertical flip augmentation =====
+        # ===== cable-direction flip augmentation =====
         if self.enable_vflip and (random.random() < self.vflip_prob):
-            # Flip image along "height" dimension (dim=1)
-            image = F.vflip(image)
+            # Tensor layout is (C, time, channel), and boxes are
+            # [channel_min, time_min, channel_max, time_max].
+            image = F.hflip(image)
 
-            # Flip boxes in y (channel axis): y' = H - y
-            H_img = image.shape[1]
-            boxes[:, [1, 3]] = H_img - boxes[:, [3, 1]]
+            # Flip boxes along the channel axis.
+            W_ch = image.shape[2]
+            boxes[:, [0, 2]] = W_ch - boxes[:, [2, 0]]
 
-            # Flip masks and attention_masks along dim=1
-            # masks shape: (N, new_h, new_w) where new_h corresponds to channel axis -> flip along dim=1
-            masks = torch.flip(masks, dims=[1])
-            attention_masks = torch.flip(attention_masks, dims=[1])
+            # Masks are (N, time, channel).
+            mask_streams_t = tuple(torch.flip(mask_streams_t[k], dims=[2]) for k in range(K))
+            masks = mask_streams_t[0]
+            confident_area_masks = torch.flip(confident_area_masks, dims=[2])
 
         target = {
             "boxes": boxes,
             "labels": labels,
             "masks": masks,
-            "attention_masks": attention_masks,
+            "confident_area_masks": confident_area_masks,
             "image_id": img_id,
             "area": areas,
             "iscrowd": iscrowd,
+            "mask_streams": mask_streams_t,
         }
+        if K >= 2:
+            target["masks_aux"] = mask_streams_t[1]
         return image, target
 
 
@@ -667,6 +946,11 @@ class DASInferDataset(Dataset):
         f_high=10.0,
         storage_backend: str = "auto",   # "auto", "local", "gcs"
         gcs_key_path: Optional[str] = None,
+        denoised_skip_preproc: bool = False,
+        denoised_apply_normalize: bool = True,
+        from_raw: bool = False,
+        display_names: Optional[List[str]] = None,
+        image_channels: int = 3,
     ):
         """
         Args:
@@ -677,6 +961,15 @@ class DASInferDataset(Dataset):
                 - "gcs":   only use GCS filesystem
                 - "auto":  decide automatically
             gcs_key_path: GCS key path (json)
+            denoised_skip_preproc: If True, use ``preprocess_denoised_rgb_only`` instead of full
+                ``preprocess_data_rgb`` (filters + 3 bands).
+            denoised_apply_normalize: When ``denoised_skip_preproc`` is True, pass through to
+                ``preprocess_denoised_rgb_only(apply_normalize=...)``. If False, triplicate raw
+                ``data`` without ``normalize()`` (for A/B testing).
+            from_raw: If True, read MBARI raw ``Acquisition/Raw[0]/...`` and compute strain rate
+                in-memory (requires ``channel_range`` = (channel_start, channel_end)).
+            display_names: Optional output basenames (e.g. from CSV ``File Name``); defaults to
+                ``os.path.basename(hdf5_files[i])``.
         """
         self.hdf5_files = list(hdf5_files)
         self.resize_scale = float(resize_scale)
@@ -687,6 +980,21 @@ class DASInferDataset(Dataset):
         self.f_high = f_high
         self.storage_backend = storage_backend
         self.gcs_key_path = gcs_key_path
+        self.denoised_skip_preproc = bool(denoised_skip_preproc)
+        self.denoised_apply_normalize = bool(denoised_apply_normalize)
+        self.from_raw = bool(from_raw)
+        self.image_channels = int(image_channels)
+        if display_names is not None:
+            if len(display_names) != len(self.hdf5_files):
+                raise ValueError(
+                    f"display_names length ({len(display_names)}) != "
+                    f"hdf5_files length ({len(self.hdf5_files)})"
+                )
+            self.display_names = list(display_names)
+        else:
+            self.display_names = [os.path.basename(p) for p in self.hdf5_files]
+        if self.from_raw and self.channel_range is None:
+            raise ValueError("from_raw=True requires channel_range=(channel_start, channel_end)")
 
     def __len__(self):
         return len(self.hdf5_files)
@@ -703,17 +1011,46 @@ class DASInferDataset(Dataset):
     def __getitem__(self, idx):
         file_path = self.hdf5_files[idx]
         backend = self._resolve_backend(file_path)
+        out_name = self.display_names[idx]
 
-        rgb, _dt = preprocess_data_rgb(
-            file_path,
-            channel_range=self.channel_range,
-            data_key=self.data_key,
-            data_is_strain_rate=self.data_is_strain_rate,
-            f_band=self.f_band,
-            f_high=self.f_high,
-            storage_backend=backend,
-            gcs_key_path=self.gcs_key_path,
-        )  # (H, W, 3)
+        if self.from_raw:
+            ch0, ch1 = self.channel_range
+            data_nch_nt, dt = load_mbari_raw_to_strain_rate_nch_nt(
+                file_path,
+                channel_start=int(ch0),
+                channel_end=int(ch1),
+                storage_backend=backend,
+                gcs_key_path=self.gcs_key_path,
+            )
+            rgb, _dt = preprocess_from_array_image(
+                data_nch_nt,
+                dt,
+                data_is_strain_rate=True,
+                f_band=self.f_band,
+                f_high=self.f_high,
+                image_channels=self.image_channels,
+            )
+        elif self.denoised_skip_preproc:
+            rgb, _dt = preprocess_denoised_rgb_only(
+                file_path,
+                channel_range=self.channel_range,
+                data_key=self.data_key,
+                storage_backend=backend,
+                gcs_key_path=self.gcs_key_path,
+                apply_normalize=self.denoised_apply_normalize,
+            )
+        else:
+            rgb, _dt = preprocess_data_image(
+                file_path,
+                channel_range=self.channel_range,
+                data_key=self.data_key,
+                data_is_strain_rate=self.data_is_strain_rate,
+                f_band=self.f_band,
+                f_high=self.f_high,
+                storage_backend=backend,
+                gcs_key_path=self.gcs_key_path,
+                image_channels=self.image_channels,
+            )  # (H, W, 3)
 
         image = torch.from_numpy(rgb).permute(2, 1, 0)  # (C, W, H)
 
@@ -723,4 +1060,4 @@ class DASInferDataset(Dataset):
         new_H = max(1, int(orig_H * self.resize_scale))
         image = F.resize(image, (new_W, new_H))
 
-        return image, os.path.basename(file_path)
+        return image, out_name

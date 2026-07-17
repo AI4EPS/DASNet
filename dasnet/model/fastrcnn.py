@@ -17,9 +17,9 @@ from torchvision.models.detection.anchor_utils import AnchorGenerator
 from torchvision.models.detection.backbone_utils import _mobilenet_extractor, _resnet_fpn_extractor, _validate_trainable_layers
 from torchvision.models.detection.generalized_rcnn import GeneralizedRCNN
 # from torchvision.models.detection.roi_heads import RoIHeads
-from .dasnet_roiheads import DASNet__RoIHeads
+from .roiheads import RoIHeads
 from torchvision.models.detection.rpn import RegionProposalNetwork, RPNHead
-from torchvision.models.detection.transform import GeneralizedRCNNTransform
+from .das_transform import DASGeneralizedRCNNTransform
 from torchvision.models.detection.faster_rcnn import FasterRCNN, _default_anchorgen, TwoMLPHead, FastRCNNPredictor
 
 __all__ = [
@@ -41,7 +41,7 @@ def _default_anchorgen():
     return AnchorGenerator(anchor_sizes, aspect_ratios)
 
 
-class DASNet__FastRCNN(GeneralizedRCNN):
+class FastRCNN(GeneralizedRCNN):
     """
     Implements Faster R-CNN.
 
@@ -257,7 +257,39 @@ class DASNet__FastRCNN(GeneralizedRCNN):
             representation_size = 1024
             box_predictor = FastRCNNPredictor(representation_size, num_classes)
 
-        roi_heads = DASNet__RoIHeads(
+        _roi_only_keys = (
+            "v_ref",
+            "spacing",
+            "time_step",
+            "enable_crop",
+            "mask_prepare_mode",
+            "attention_gate_floor",
+            "attention_gate_constrain_masks",
+            "attention_gate_mask_dilate_px",
+            "arrival_band_alpha",
+            "arrival_band_before_frac",
+            "arrival_band_after_frac",
+            "arrival_gate_class_ids",
+            "enable_learned_mask_gate",
+            "loss_mask_gate_weight",
+            "record_inference_mask_gate",
+            "arrival_centroid_use_confident_area",
+            "use_learned_temporal_crop",
+            "loss_temporal_crop_weight",
+            "temporal_crop_loss_divisor",
+            "mask_streams_by_category",
+            "dual_mask_class_ids",
+            "enable_dual_mask_aux",
+            "skip_inactive_mask_streams_at_inference",
+        )
+        roi_heads_kw = {}
+        for _k in _roi_only_keys:
+            if _k in kwargs:
+                roi_heads_kw[_k] = kwargs.pop(_k)
+
+        roi_heads_kw["fpn_out_channels"] = out_channels
+
+        roi_heads = RoIHeads(
             # Box
             box_roi_pool,
             box_head,
@@ -270,13 +302,14 @@ class DASNet__FastRCNN(GeneralizedRCNN):
             box_score_thresh,
             box_nms_thresh,
             box_detections_per_img,
+            **roi_heads_kw,
         )
 
         if image_mean is None:
             image_mean = [0.485, 0.456, 0.406]
         if image_std is None:
             image_std = [0.229, 0.224, 0.225]
-        transform = GeneralizedRCNNTransform(min_size, max_size, image_mean, image_std, **kwargs)
+        transform = DASGeneralizedRCNNTransform(min_size, max_size, image_mean, image_std, **kwargs)
 
         super().__init__(backbone, rpn, roi_heads, transform)
 
