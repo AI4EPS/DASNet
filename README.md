@@ -1,12 +1,7 @@
 # DASNet
 
-DASNet trains a Mask R-CNN model to detect DAS events and extract arrival picks
-from local HDF5 files. This release contains only the training and prediction
-workflow.
-
-No license is included in this package. Do not assume permission to redistribute,
-modify, or use the code beyond the rights explicitly granted by its copyright
-holder.
+DASNet trains a modified Mask R-CNN model to detect DAS events and extract arrival picks
+from local HDF5 files.
 
 ## Installation
 
@@ -23,12 +18,6 @@ Preprocessed HDF5 files must contain a `data` dataset with shape
 `(number_of_channels, number_of_time_samples)` and a scalar `dt_s` attribute.
 The data is expected to be strain rate.
 
-The original input readers are retained. Prediction accepts preprocessed HDF5
-files, denoised `data` fields, and raw MBARI HDF5 files with
-`Acquisition/Raw[0]/RawData` and `RawDataTime`. The CSV uses `path` for
-preprocessed input, or `File Path` (and optionally `File Name`) with
-`--from-raw`. Local paths and `gs://` paths are both supported.
-
 Training annotations use COCO JSON. Each `images` entry must refer to an HDF5
 file through `file_name`, with `width` set to the time-sample count and `height`
 set to the channel count. An annotation uses:
@@ -43,7 +32,7 @@ For multiple arrival phases, provide additional polyline fields such as
 ## Training
 
 The following command trains a one-class model plus background with two mask
-streams. Adjust paths and geometry for your dataset.
+streams. Adjust paths and geometry for your dataset. Change --num-classes to n+1 for n-class model.
 
 ```bash
 python train.py \
