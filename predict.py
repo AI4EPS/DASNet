@@ -22,6 +22,9 @@ from dasnet.model.checkpoint_config import resolve_backbone, restore_prediction_
 from dasnet.model.rpn_anchor_config import resolve_rpn_anchor_sizes
 
 
+DEFAULT_PLOT_ARRIVAL_CLASSES = (2, 3, 8)  # Monterey: Blue B, Fin, earthquake P/S.
+
+
 def parse_anchor_sizes(value: str):
     """Parse comma-separated RPN anchor sizes, optionally grouped by semicolon."""
     groups = [group.strip() for group in value.split(";") if group.strip()]
@@ -157,13 +160,36 @@ def prediction_record(file_name: str, prediction: dict, args) -> dict:
     }
 
 
+def keep_labels_inside_axes(figure, labels, margin_pixels=4):
+    """Fit the entire text background inside its axes after layout is finalized."""
+    renderer = figure.canvas.get_renderer()
+    for text in labels:
+        axis = text.axes
+        bounds = axis.get_window_extent(renderer)
+        text.update_bbox_position_size(renderer)
+        box = text.get_bbox_patch().get_window_extent(renderer)
+        while (box.width > bounds.width - 2 * margin_pixels or
+               box.height > bounds.height - 2 * margin_pixels) and text.get_fontsize() > 1:
+            text.set_fontsize(text.get_fontsize() * 0.9)
+            text.update_bbox_position_size(renderer)
+            box = text.get_bbox_patch().get_window_extent(renderer)
+        dx = max(bounds.x0 + margin_pixels - box.x0,
+                 min(0, bounds.x1 - margin_pixels - box.x1))
+        dy = max(bounds.y0 + margin_pixels - box.y0,
+                 min(0, bounds.y1 - margin_pixels - box.y1))
+        position = text.get_transform().transform(text.get_position())
+        text.set_position(text.get_transform().inverted().transform(position + [dx, dy]))
+
+
 def save_prediction_figure(file_name: str, image: torch.Tensor, prediction: dict, args):
-    """Save the three input channels with predicted boxes, masks, and picks."""
+    """Show all detection boxes and arrival overlays for selected categories."""
     scores = prediction["scores"]
     keep = np.flatnonzero(scores >= args.min_probability)
     views = [image[min(index, image.shape[0] - 1)].numpy() for index in range(3)]
-    figure, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+    figure, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True, dpi=150)
     colors = ("cyan", "magenta", "lime")
+    box_labels = []
+    arrival_classes = set(getattr(args, "plot_arrival_classes", DEFAULT_PLOT_ARRIVAL_CLASSES))
 
     for panel_index, axis in enumerate(axes):
         background = views[panel_index].T
@@ -192,13 +218,22 @@ def save_prediction_figure(file_name: str, image: torch.Tensor, prediction: dict
                     linewidth=1.5,
                 )
             )
-            axis.text(
+            text = axis.text(
                 time_min + 20,
                 channel_max - 10,
                 f"Class {label}\n{scores[index]:.2f}",
-                color="white",
+                color="black",
                 fontsize=8,
+                ha="left",
+                va="top",
+                bbox=dict(facecolor="white", alpha=0.75, edgecolor="none", pad=2),
+                clip_on=True,
+                zorder=10,
             )
+            text.set_in_layout(False)
+            box_labels.append(text)
+            if label not in arrival_classes:
+                continue
             for stream_index, mask in enumerate(
                 active_mask_streams(prediction, index, args.mask_streams_by_category)
             ):
@@ -231,6 +266,7 @@ def save_prediction_figure(file_name: str, image: torch.Tensor, prediction: dict
     axes[-1].set_xlabel("Time sample index")
     figure.suptitle(os.path.basename(file_name))
     figure.tight_layout()
+    keep_labels_inside_axes(figure, box_labels)
     os.makedirs(args.figure_dir, exist_ok=True)
     figure.savefig(
         os.path.join(args.figure_dir, f"{os.path.splitext(os.path.basename(file_name))[0]}.png"),
@@ -402,6 +438,10 @@ def get_parser():
     parser.add_argument("--plot-figure", action="store_true", help="Save prediction overlays as PNG files.")
     parser.add_argument("--figure-dir", help="Directory for prediction figures.")
     parser.add_argument("--plot-mask-threshold", type=float, default=0.25)
+    parser.add_argument(
+        "--plot-arrival-classes", nargs="+", type=int, default=list(DEFAULT_PLOT_ARRIVAL_CLASSES),
+        help="Category IDs whose masks and picks are drawn (default: 2 3 8, Monterey Blue B / Fin / earthquake P-S). All detection boxes remain visible; JSON predictions are unchanged.",
+    )
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     return parser
 

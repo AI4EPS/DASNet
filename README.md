@@ -103,6 +103,13 @@ Prediction writes one JSON file per HDF5 input. Each record contains detection
 boxes in `[channel_start, time_start, channel_end, time_end]` order and
 per-stream pick coordinates in `[channel, time]` order.
 
+With `--plot-figure`, all detected classes keep their boxes and labels. Arrival
+masks and picks are drawn only for Monterey categories 2 (Blue whale B), 3
+(Fin whale), and 8 (earthquake P/S). Use `--plot-arrival-classes` to supply other
+category IDs for a different dataset. This display filter does not change JSON
+predictions. Box labels use black text on a translucent white background and
+stay inside the plotting area.
+
 The model architecture options, class count, input channel count, crop geometry,
 mask-stream configuration, learned temporal crop option, and RPN anchor settings
 must match the checkpoint. A mismatch can prevent checkpoint loading or produce
