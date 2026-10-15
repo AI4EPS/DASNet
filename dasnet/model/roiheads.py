@@ -1762,21 +1762,9 @@ class RoIHeads(nn.Module):
                                 self.arrival_band_before_frac,
                                 self.arrival_band_after_frac,
                             )
-                            scales_tc = calculate_expansion_scale(
-                                orig_shapes, exp_shapes, expand_vertical=True
-                            )
-                            if any(float(s) > 1.0 + 1e-6 for s in scales_tc):
-                                # One tensor (B, C, H, W) per level: all batch rows must share the same H, W.
-                                # Per-image expansion ratios differ → use max ratio for every image and
-                                # matching logical heights ceil(H_orig * s_max).
-                                s_max = max(float(s) for s in scales_tc)
-                                scales_unified = [s_max] * len(orig_shapes)
-                                feat_mask = expand_features(feat_mask, scales_unified, expand_vertical=True)
-                                img_shapes_m = [
-                                    (int(math.ceil(float(ho) * s_max)), int(wo)) for ho, wo in orig_shapes
-                                ]
-                            else:
-                                img_shapes_m = list(exp_shapes)
+                            # Temporal windows stay in original image coordinates.
+                            # Do not expand/shift features or alter the RoIAlign scale.
+                            img_shapes_m = list(exp_shapes)
                             if (
                                 self.training
                                 and targets is not None

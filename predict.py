@@ -17,6 +17,8 @@ from torch.utils.data import DataLoader
 
 from dasnet.data.das import DASInferDataset
 from dasnet.model.dasnet import build_model as build_dasnet_model
+from dasnet.model.backbones import SUPPORTED_BACKBONES
+from dasnet.model.checkpoint_config import resolve_backbone, restore_prediction_config
 from dasnet.model.rpn_anchor_config import resolve_rpn_anchor_sizes
 
 
@@ -239,6 +241,7 @@ def save_prediction_figure(file_name: str, image: torch.Tensor, prediction: dict
 
 def build_model(args):
     """Construct a model matching the checkpoint configuration."""
+    resolve_backbone(args)
     anchor_sizes, anchor_metadata = resolve_rpn_anchor_sizes(
         args.rpn_anchor_sizes,
         auto=args.rpn_anchor_auto,
@@ -252,11 +255,13 @@ def build_model(args):
     if anchor_metadata:
         print(f"Resolved RPN anchor sizes: {anchor_metadata['anchor_sizes']}")
     return build_dasnet_model(
-        model_name="maskrcnn_resnet50_selectable_fpn",
+        model_name="maskrcnn_selectable_fpn",
+        backbone_name=args.backbone,
+        load_backbone_weights=False,
         num_classes=args.num_classes,
         in_channels=args.image_channels,
         pretrained=False,
-        pretrained_backbone=True,
+        pretrained_backbone=args.backbone_weights == "imagenet",
         trainable_backbone_layers=3,
         target_layer="P4",
         box_roi_pool_size=7,
@@ -277,6 +282,8 @@ def build_model(args):
 
 
 def main(args):
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    restore_prediction_config(args, checkpoint)
     paths, names = read_input_paths(args.data_list, args.from_raw)
     channel_range = (
         (args.channel_start, args.channel_end) if args.from_raw else None
@@ -303,7 +310,6 @@ def main(args):
         collate_fn=collate_batch,
     )
     model = build_model(args).to(args.device)
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.eval()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -339,7 +345,9 @@ def get_parser():
     parser.add_argument("--checkpoint", required=True, help="Path to a training checkpoint.")
     parser.add_argument("--data-list", required=True, help="CSV containing input file paths.")
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--num-classes", required=True, type=int)
+    parser.add_argument("--backbone", choices=SUPPORTED_BACKBONES, default=None, help="Read from checkpoint; explicit mismatches are rejected.")
+    parser.add_argument("--backbone-weights", choices=("imagenet", "none"), default=None)
+    parser.add_argument("--num-classes", type=int, default=None, help="Read from checkpoint when available.")
     parser.add_argument("--image-channels", choices=(1, 3), type=int, default=1)
     parser.add_argument(
         "--from-raw",
@@ -365,9 +373,9 @@ def get_parser():
         action="store_true",
         help="Do not normalize data when --denoised-skip-preproc is set.",
     )
-    parser.add_argument("--resize-scale", type=float, default=1.0)
-    parser.add_argument("--transform-min-size", type=int, default=2048)
-    parser.add_argument("--transform-max-size", type=int, default=4096)
+    parser.add_argument("--resize-scale", type=float, default=0.5)
+    parser.add_argument("--transform-min-size", type=int, default=1422)
+    parser.add_argument("--transform-max-size", type=int, default=6000)
     parser.add_argument("--mask-streams-by-class", default="")
     parser.add_argument(
         "--mask-prepare-mode",

@@ -3,11 +3,11 @@ Learned temporal window for the mask branch (replaces rule-based ``crop_mask_pro
 
 Predicts a time anchor inside each detection proposal, then builds
 ``[t_anchor - before_frac * L, t_anchor + after_frac * L]`` with
-``L = max(1, alpha * W_image)`` (same as ``arrival_band``).
+``L = max(1, alpha * (proposal_x2 - proposal_x1))``.
 
-The interval is **not** clamped to the proposal: if it exceeds the current image time extent,
-callers should zero-pad the FPN (``expand_features`` + larger ``image_shapes``), mirroring the
-original crop pipeline's aspect-ratio-friendly expansion rather than shrinking the window.
+The interval is not clamped to the proposal or image. Keep the original coordinate
+system for feature pooling, target projection, and mask pasting. RoIAlign handles
+out-of-bounds samples; no image-wide shift or feature expansion is needed.
 """
 from __future__ import annotations
 
@@ -45,11 +45,9 @@ def adjust_mask_proposals_temporal(
     """
     Build mask RoI time windows from predicted anchors (no clamp to proposal time span).
 
-    Returns adjusted boxes in the **expanded** logical grid, and ``expanded_image_shapes`` so
-    callers can ``expand_features`` + ``mask_roi_pool`` like the rule-based crop path.
-
-    If ``min(y_window) < 0``, applies a **global time shift** for that image so windows start at
-    non-negative y (FPN pad is bottom-only in this codebase).
+    Returns boxes in original image coordinates (possibly outside the image),
+    unshifted anchors, and unchanged image shapes. The same boxes must be used
+    for mask feature pooling, GT projection, and inference mask pasting.
     """
     if not proposals_per_image:
         return [], anchor_logits.new_zeros((0,)), list(image_shapes)
@@ -62,19 +60,17 @@ def adjust_mask_proposals_temporal(
     chunks = torch.split(anchor_logits, sizes, dim=0)
     out_list: List[torch.Tensor] = []
     y_parts: List[torch.Tensor] = []
-    expanded_image_shapes: List[Tuple[int, int]] = []
+    output_image_shapes: List[Tuple[int, int]] = []
 
     for i, prop in enumerate(proposals_per_image):
         if prop.numel() == 0:
             out_list.append(prop)
-            expanded_image_shapes.append(image_shapes[i])
+            output_image_shapes.append(image_shapes[i])
             continue
         logits_i = chunks[i]
         H_i, W_i = image_shapes[i]
-        L = max(1.0, float(alpha) * float(W_i))
-        L_t = prop.new_tensor(L)
-
         x1, y1, x2, y2 = prop.unbind(dim=1)
+        L_t = (float(alpha) * (x2 - x1)).clamp(min=1.0)
         h = (y2 - y1).clamp(min=1.0)
         frac = torch.sigmoid(logits_i)
         y_anchor = y1 + frac * h
@@ -82,25 +78,13 @@ def adjust_mask_proposals_temporal(
         y1p = y_anchor + float(after_frac) * L_t
         ya, yb = torch.minimum(y0p, y1p), torch.maximum(y0p, y1p)
 
-        # Shift so min time >= 0 (bottom-only FPN padding cannot add virtual rows above 0).
-        shift = torch.clamp(-torch.min(ya), min=torch.tensor(0.0, device=ya.device, dtype=ya.dtype))
-        ya_s = ya + shift
-        yb_s = yb + shift
-
-        # Extend logical height with zeros at the bottom so the full window fits (like crop+expand).
-        y_max_need = torch.max(yb_s)
-        H_new = max(H_i, int(torch.ceil(y_max_need).item()) + 1)
-        Hm1 = y1.new_tensor(float(H_new - 1))
-        z = y1.new_tensor(0.0)
-        y_lo = torch.clamp(ya_s, min=z, max=Hm1)
-        y_hi = torch.clamp(yb_s, min=z, max=Hm1)
-        y_hi = torch.maximum(y_hi, y_lo + 1.0)
-
-        new_boxes = torch.stack((x1, y_lo, x2, y_hi), dim=1)
+        # Keep even negative/out-of-image coordinates: shifting boxes alone
+        # changes the sampled signal and couples otherwise independent proposals.
+        new_boxes = torch.stack((x1, ya, x2, yb), dim=1)
         out_list.append(new_boxes)
         y_parts.append(y_anchor)
-        expanded_image_shapes.append((H_new, W_i))
+        output_image_shapes.append((H_i, W_i))
 
     if not y_parts:
         return out_list, anchor_logits.new_zeros((0,)), list(image_shapes)
-    return out_list, torch.cat(y_parts, dim=0), expanded_image_shapes
+    return out_list, torch.cat(y_parts, dim=0), output_image_shapes

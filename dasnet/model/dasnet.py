@@ -1,39 +1,11 @@
 from .maskrcnn import MaskRCNN
-import torch
 import torchvision
-from torchvision.ops import misc as misc_nn_ops
-from torchvision.models.detection.mask_rcnn import MaskRCNNHeads, MaskRCNNPredictor, MaskRCNN_ResNet50_FPN_Weights
-from torchvision.models._utils import _ovewrite_value_param
-from torchvision.models.resnet import resnet50, ResNet50_Weights
-from torchvision.models.detection.backbone_utils import _validate_trainable_layers
+from torchvision.models.detection.mask_rcnn import MaskRCNNPredictor
 from torchvision.models.detection.rpn import AnchorGenerator, RPNHead
 from torch import nn
 import copy
-from .backbone_utils import _resnet_customfpn_extractor
+from .backbones import build_backbone
 from typing import Optional, Tuple
-
-
-def _adapt_resnet_input_channels(backbone: nn.Module, in_channels: int) -> None:
-    """Replace ResNet conv1 for non-RGB inputs.
-
-    New weights are initialized from the (pretrained) RGB kernels averaged over
-    the input dim, scaled so the expected response magnitude is preserved.
-    """
-    old = backbone.conv1
-    new = nn.Conv2d(
-        in_channels,
-        old.out_channels,
-        kernel_size=old.kernel_size,
-        stride=old.stride,
-        padding=old.padding,
-        bias=old.bias is not None,
-    )
-    with torch.no_grad():
-        mean_w = old.weight.mean(dim=1, keepdim=True)  # (64, 1, 7, 7)
-        new.weight.copy_(mean_w.repeat(1, in_channels, 1, 1) * (3.0 / in_channels))
-        if old.bias is not None:
-            new.bias.copy_(old.bias)
-    backbone.conv1 = new
 
 
 def build_model(
@@ -48,37 +20,23 @@ def build_model(
     in_channels: int = 3,
     rpn_anchor_sizes: Optional[Tuple[Tuple[int, ...], ...]] = None,
     rpn_anchor_aspect_ratios: Optional[Tuple[Tuple[float, ...], ...]] = None,
+    backbone_name: str = "resnet50",
+    load_backbone_weights: bool = True,
     **kwargs
 ) -> MaskRCNN:
 
-    # MaskRCNN-ResNet50-FPN pretrained weights
-    weights = MaskRCNN_ResNet50_FPN_Weights.DEFAULT if pretrained else None
-
-    # ResNet pretrained weights
-    weights_backbone = ResNet50_Weights.IMAGENET1K_V1 if pretrained_backbone else None
-
-    if weights is not None:
-        weights_backbone = None
-        num_classes = _ovewrite_value_param("num_classes", num_classes, len(weights.meta["categories"]))
-    elif num_classes is None:
-        num_classes = 91
-
-    is_trained = weights is not None or weights_backbone is not None
-    trainable_backbone_layers = _validate_trainable_layers(is_trained, trainable_backbone_layers, 5, 3)
-    norm_layer = misc_nn_ops.FrozenBatchNorm2d if is_trained else nn.BatchNorm2d
-
-    # backbone
-    if model_name == "maskrcnn_resnet50_selectable_fpn":
-        backbone = resnet50(weights=weights_backbone, progress=True, norm_layer=norm_layer)
-        if in_channels != 3:
-            _adapt_resnet_input_channels(backbone, in_channels)
-        backbone = _resnet_customfpn_extractor(backbone, trainable_backbone_layers, target_layer)
-    else:
+    if model_name not in ("maskrcnn_resnet50_selectable_fpn", "maskrcnn_selectable_fpn"):
         raise ValueError(f"Unsupported model_name: {model_name}")
+    if pretrained:
+        raise ValueError("Full torchvision MaskRCNN weights do not match this custom 128-channel FPN; use pretrained_backbone=True instead.")
+    if num_classes is None:
+        num_classes = 91
+    backbone = build_backbone(
+        backbone_name, pretrained=pretrained_backbone, load_weights=load_backbone_weights,
+        in_channels=in_channels, trainable_layers=trainable_backbone_layers,
+        target_layer=target_layer)
 
     if in_channels != 3:
-        if pretrained:
-            raise ValueError("pretrained MaskRCNN weights are RGB-only; use pretrained_backbone with in_channels != 3")
         # transform normalization must match channel count; data is already
         # z-scored so use the averaged ImageNet stats per channel
         kwargs.setdefault("image_mean", [0.449] * in_channels)
@@ -108,46 +66,42 @@ def build_model(
         sampling_ratio=2,
     )
 
-    if model_name == "maskrcnn_resnet50_selectable_fpn":
-        if rpn_anchor_sizes is None:
-            if target_layer == 'P2':
-                anchor_sizes = ((32,), (64,), (128,), (256,), (512,))
-            elif target_layer == 'P3':
-                anchor_sizes = ((64,), (64,), (128,), (256,), (512,))
-            elif target_layer == 'P4':
-                anchor_sizes = ((128,), (128,), (128,), (256,), (512,))
-            elif target_layer == 'P5':
-                anchor_sizes = ((256,), (256,), (256,), (256,), (512,))
-            else:
-                anchor_sizes = ((512,), (512,), (512,), (512,), (512,))
+    if rpn_anchor_sizes is None:
+        if target_layer == 'P2':
+            anchor_sizes = ((32,), (64,), (128,), (256,), (512,))
+        elif target_layer == 'P3':
+            anchor_sizes = ((64,), (64,), (128,), (256,), (512,))
+        elif target_layer == 'P4':
+            anchor_sizes = ((128,), (128,), (128,), (256,), (512,))
+        elif target_layer == 'P5':
+            anchor_sizes = ((256,), (256,), (256,), (256,), (512,))
         else:
-            anchor_sizes = rpn_anchor_sizes
+            anchor_sizes = ((512,), (512,), (512,), (512,), (512,))
+    else:
+        anchor_sizes = rpn_anchor_sizes
 
-        if rpn_anchor_aspect_ratios is None:
-            aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
-        elif len(rpn_anchor_aspect_ratios) == 1:
-            aspect_ratios = rpn_anchor_aspect_ratios * len(anchor_sizes)
-        elif len(rpn_anchor_aspect_ratios) == len(anchor_sizes):
-            aspect_ratios = rpn_anchor_aspect_ratios
-        else:
-            raise ValueError(
-                "rpn_anchor_aspect_ratios must have either one group or the same "
-                f"number of groups as rpn_anchor_sizes ({len(anchor_sizes)}), got {len(rpn_anchor_aspect_ratios)}"
-            )
-        anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
-        num_anchors_per_location = anchor_generator.num_anchors_per_location()
-        if len(set(num_anchors_per_location)) != 1:
-            raise ValueError(
-                "All FPN levels must have the same number of anchors per location; "
-                f"got {num_anchors_per_location}. Adjust sizes/ratios so len(sizes[i]) * len(ratios[i]) is constant."
-            )
-        model.rpn.anchor_generator = anchor_generator
-        num_anchors = int(num_anchors_per_location[0])
-        if model.rpn.head.cls_logits.out_channels != num_anchors:
-            model.rpn.head = RPNHead(model.backbone.out_channels, num_anchors)
-
-    if weights is not None:
-        model.load_state_dict(weights.get_state_dict(progress=True))
+    if rpn_anchor_aspect_ratios is None:
+        aspect_ratios = ((0.5, 1.0, 2.0),) * len(anchor_sizes)
+    elif len(rpn_anchor_aspect_ratios) == 1:
+        aspect_ratios = rpn_anchor_aspect_ratios * len(anchor_sizes)
+    elif len(rpn_anchor_aspect_ratios) == len(anchor_sizes):
+        aspect_ratios = rpn_anchor_aspect_ratios
+    else:
+        raise ValueError(
+            "rpn_anchor_aspect_ratios must have either one group or the same "
+            f"number of groups as rpn_anchor_sizes ({len(anchor_sizes)}), got {len(rpn_anchor_aspect_ratios)}"
+        )
+    anchor_generator = AnchorGenerator(sizes=anchor_sizes, aspect_ratios=aspect_ratios)
+    num_anchors_per_location = anchor_generator.num_anchors_per_location()
+    if len(set(num_anchors_per_location)) != 1:
+        raise ValueError(
+            "All FPN levels must have the same number of anchors per location; "
+            f"got {num_anchors_per_location}. Adjust sizes/ratios so len(sizes[i]) * len(ratios[i]) is constant."
+        )
+    model.rpn.anchor_generator = anchor_generator
+    num_anchors = int(num_anchors_per_location[0])
+    if model.rpn.head.cls_logits.out_channels != num_anchors:
+        model.rpn.head = RPNHead(model.backbone.out_channels, num_anchors)
 
     return model
 

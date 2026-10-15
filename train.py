@@ -18,6 +18,8 @@ import utils
 from dasnet.data.das import DASTrainDataset
 from dasnet.data.das_crop import DASCropTrainDataset
 from dasnet.model.dasnet import build_model
+from dasnet.model.backbones import SUPPORTED_BACKBONES
+from dasnet.model.checkpoint_config import resolve_backbone
 from dasnet.model.rpn_anchor_config import resolve_rpn_anchor_sizes
 
 
@@ -98,11 +100,18 @@ def learning_rate_lambda(step: int, max_lr: float, min_lr: float, warmup: int, t
 
 
 def move_targets(targets, device):
-    """Move tensor fields in a target batch to the selected device."""
-    return [
-        {key: value.to(device) if isinstance(value, torch.Tensor) else value for key, value in target.items()}
-        for target in targets
-    ]
+    """Move nested mask streams together with all other target tensors."""
+    def move(value):
+        if isinstance(value, torch.Tensor):
+            return value.to(device)
+        if isinstance(value, dict):
+            return {key: move(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(move(item) for item in value)
+        if isinstance(value, list):
+            return [move(item) for item in value]
+        return value
+    return [move(target) for target in targets]
 
 
 def make_loss_logger():
@@ -153,6 +162,7 @@ def train_epoch(model, loader, optimizer, scheduler, scaler, epoch, args):
             scheduler.step()
         logger.update(loss=losses.item(), lr=optimizer.param_groups[0]["lr"])
     logger.synchronize_between_processes()
+    return {name: meter.global_avg for name, meter in logger.meters.items()}
 
 
 @torch.inference_mode()
@@ -218,6 +228,7 @@ def build_datasets(args):
             resize_scale=args.resize_scale,
             synthetic_noise=bool(args.noise_csv),
             noise_csv=args.noise_csv,
+            enable_stack_event=False,
             enable_vflip=True,
             **stream_options,
         )
@@ -226,6 +237,7 @@ def build_datasets(args):
             root_dir=args.val_data_path,
             resize_scale=args.resize_scale,
             synthetic_noise=False,
+            enable_stack_event=False,
             enable_vflip=False,
             **stream_options,
         )
@@ -259,8 +271,9 @@ def build_dataloaders(train_dataset, validation_dataset, args):
     return train_loader, validation_loader, train_sampler
 
 
-def build_dasnet(args):
+def build_dasnet(args, *, load_backbone_weights=True):
     """Construct the training model from command-line configuration."""
+    resolve_backbone(args)
     anchor_sizes, anchor_metadata = resolve_rpn_anchor_sizes(
         args.rpn_anchor_sizes,
         auto=args.rpn_anchor_auto,
@@ -274,11 +287,13 @@ def build_dasnet(args):
     if anchor_metadata and utils.is_main_process():
         print(f"Resolved RPN anchor sizes: {anchor_metadata['anchor_sizes']}")
     return build_model(
-        model_name="maskrcnn_resnet50_selectable_fpn",
+        model_name="maskrcnn_selectable_fpn",
+        backbone_name=args.backbone,
+        load_backbone_weights=load_backbone_weights,
         num_classes=args.num_classes,
         in_channels=args.image_channels,
         pretrained=False,
-        pretrained_backbone=True,
+        pretrained_backbone=args.backbone_weights == "imagenet",
         trainable_backbone_layers=3,
         target_layer="P4",
         box_roi_pool_size=7,
@@ -314,6 +329,8 @@ def save_checkpoint(path, model, optimizer, scheduler, epoch, args):
 
 def main(args):
     utils.init_distributed_mode(args)
+    checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False) if args.resume else None
+    resolve_backbone(args, checkpoint)
     os.makedirs(args.output_dir, exist_ok=True)
     torch.manual_seed(args.seed + utils.get_rank())
     device = torch.device(args.device)
@@ -328,7 +345,7 @@ def main(args):
     train_loader, validation_loader, train_sampler = build_dataloaders(
         train_dataset, validation_dataset, args
     )
-    model = build_dasnet(args).to(device)
+    model = build_dasnet(args, load_backbone_weights=checkpoint is None).to(device)
     model_without_ddp = model
     if args.distributed:
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[args.gpu])
@@ -348,7 +365,6 @@ def main(args):
     )
     start_epoch = 0
     if args.resume:
-        checkpoint = torch.load(args.resume, map_location="cpu", weights_only=False)
         model_without_ddp.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         scheduler.load_state_dict(checkpoint["lr_scheduler"])
@@ -359,7 +375,7 @@ def main(args):
     for epoch in range(start_epoch, args.epochs):
         if train_sampler:
             train_sampler.set_epoch(epoch)
-        train_epoch(model, train_loader, optimizer, scheduler, scaler, epoch, args)
+        train_metrics = train_epoch(model, train_loader, optimizer, scheduler, scaler, epoch, args)
         loss = validate(model, validation_loader, args)
         if utils.is_main_process():
             state_path = os.path.join(args.output_dir, "checkpoint.pth")
@@ -374,6 +390,8 @@ def main(args):
                     epoch,
                     args,
                 )
+            with open(os.path.join(args.output_dir, "metrics.jsonl"), "a", encoding="utf-8") as log:
+                log.write(json.dumps({"epoch": epoch, "train": train_metrics, "validation_loss": loss}) + "\n")
             print(f"Validation loss: {loss:.6f}")
     if utils.is_main_process():
         duration = datetime.timedelta(seconds=int(time.time() - started))
@@ -387,6 +405,10 @@ def get_parser():
     parser.add_argument("--val-data-path", required=True, help="Directory containing validation HDF5 files.")
     parser.add_argument("--val-anno-path", required=True, help="Validation COCO annotation JSON.")
     parser.add_argument("--output-dir", required=True, help="Directory for checkpoints.")
+    parser.add_argument("--backbone", choices=SUPPORTED_BACKBONES, default=None,
+                        help="Default swin_t; inherited from checkpoint on resume.")
+    parser.add_argument("--backbone-weights", choices=("imagenet", "none"), default=None,
+                        help="Default imagenet; none initializes the backbone randomly.")
     parser.add_argument("--num-classes", type=int, required=True, help="Class count including background.")
     parser.add_argument("--image-channels", choices=(1, 3), type=int, default=3)
     parser.add_argument(
@@ -398,7 +420,7 @@ def get_parser():
     parser.add_argument("--crop-samples", type=int, default=4096)
     parser.add_argument("--min-picks-anchor", type=int, default=64)
     parser.add_argument("--min-picks-keep", type=int, default=8)
-    parser.add_argument("--resize-scale", type=float, default=1.0)
+    parser.add_argument("--resize-scale", type=float, default=0.5)
     parser.add_argument("--allowed-bins-json", help="Optional SNR-bin configuration JSON.")
     parser.add_argument("--noise-csv", help="Optional CSV with a File Path column for noise augmentation.")
     parser.add_argument("--mask-streams-by-class", default="", help="Mask stream counts, for example 1:2.")
@@ -408,8 +430,8 @@ def get_parser():
     parser.add_argument("--arrival-band-alpha", type=float, default=1.0)
     parser.add_argument("--arrival-band-before-frac", type=float, default=0.5)
     parser.add_argument("--arrival-band-after-frac", type=float, default=0.5)
-    parser.add_argument("--transform-min-size", type=int, default=2048)
-    parser.add_argument("--transform-max-size", type=int, default=4096)
+    parser.add_argument("--transform-min-size", type=int, default=1422)
+    parser.add_argument("--transform-max-size", type=int, default=6000)
     parser.add_argument("--rpn-anchor-sizes", default="")
     parser.add_argument("--rpn-anchor-aspect-ratios", default="")
     parser.add_argument("--rpn-anchor-auto", action="store_true")
