@@ -31,15 +31,11 @@ For multiple arrival phases, provide additional polyline fields such as
 
 ## Training
 
-New training defaults to **Swin-Tiny** with ImageNet initialization. Use
+Training defaults to **Swin-Tiny** with ImageNet initialization. Use
 `--backbone resnet50` to select the legacy backbone, or
 `--backbone-weights none` for random initialization. Swin's four stages feed the
 existing 128-channel FPN; their outputs are pooled by two to retain the legacy
 FPN strides. All Swin stages are trainable.
-
-The box head and fixed **42 × 42 mask RoIAlign** remain unchanged. This branch
-does not include the experimental high-resolution decoder, attention, magnitude,
-or polarity heads.
 
 The following command trains a one-class model plus background with two mask
 streams. Adjust paths and geometry for your dataset. Set `--num-classes` to
@@ -97,18 +93,17 @@ python predict.py \
 Checkpoints predating backbone metadata are treated as ResNet50. Explicit
 conflicting backbone options are rejected. For checkpoints without training
 arguments, supply the class count and matching input/mask/RPN settings manually.
-For raw MBARI input, add `--from-raw --channel-start START --channel-end END`.
+For raw SeaFOAM input, add `--from-raw --channel-start START --channel-end END`.
 
 Prediction writes one JSON file per HDF5 input. Each record contains detection
 boxes in `[channel_start, time_start, channel_end, time_end]` order and
 per-stream pick coordinates in `[channel, time]` order.
 
 With `--plot-figure`, all detected classes keep their boxes and labels. Arrival
-masks and picks are drawn only for Monterey categories 2 (Blue whale B), 3
+masks and picks are drawn only for categories 2 (Blue whale B), 3
 (Fin whale), and 8 (earthquake P/S). Use `--plot-arrival-classes` to supply other
 category IDs for a different dataset. This display filter does not change JSON
-predictions. Box labels use black text on a translucent white background and
-stay inside the plotting area.
+predictions.
 
 The model architecture options, class count, input channel count, crop geometry,
 mask-stream configuration, learned temporal crop option, and RPN anchor settings
@@ -125,12 +120,7 @@ geometry explicitly (for example `--resize-scale 1.0` with 2048/4096).
 With `--use-learned-temporal-crop`, each stream uses a window of length
 `max(1, alpha * proposal_channel_width)` around its predicted anchor. The
 window keeps original image coordinates, including negative/beyond-end time
-coordinates. Feature pooling, target projection and mask pasting use the same
-window; no proposal-dependent global shift or feature expansion is applied.
-
-This corrects the historical image-width window and boundary-shift behavior.
-Existing checkpoint tensor shapes remain compatible, but their inference
-geometry changes; reevaluate predictions and retrain for controlled comparisons.
+coordinates. 
 
 Run geometry, backbone, backward-pass and checkpoint regression tests with:
 
