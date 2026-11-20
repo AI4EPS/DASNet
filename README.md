@@ -95,7 +95,6 @@ Labels of the pretrained model:
 | 6 | T wave |
 | 7 | Ship |
 | 8 | Earthquake (P and S) |
-| 9 | Sei whale |
 
 With `--plot-figure`, figures are saved in `results/figures/`. Their axes are in
 the downsampled grid (input indices × `resize_scale`).
