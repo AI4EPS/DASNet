@@ -1,49 +1,120 @@
 # DASNet
 
-DASNet trains a modified Mask R-CNN model to detect DAS events and extract arrival picks
-from local HDF5 files.
+DASNet detects signals in Distributed Acoustic Sensing (DAS) data, such as whale
+calls, earthquakes, ships and T waves, classifies them, and picks their arrival
+times. It is a Mask R-CNN with a Swin-Tiny backbone.
 
 ## Installation
 
-Use a Python environment with a PyTorch and torchvision build compatible with
-your CUDA driver, then install the remaining dependencies:
-
 ```bash
+git clone https://github.com/AI4EPS/DASNet.git
+cd DASNet
+conda create -n dasnet python=3.11 -y
+conda activate dasnet
+pip install torch torchvision   # choose the build for your CUDA version at https://pytorch.org
 pip install -r requirements.txt
 ```
 
+## Quick start
+
+1. Download the pretrained model (trained on Monterey Bay DAS data):
+
+   ```bash
+   wget https://github.com/AI4EPS/DASNet/releases/download/v1.0.1/dasnet_swin_t_monterey.pth
+   ```
+
+2. Download example data. More files are in the
+   [monterey_bay dataset](https://huggingface.co/datasets/AI4EPS/quakeflow_das/tree/main/monterey_bay/data).
+
+   ```bash
+   mkdir -p data
+   wget -P data https://huggingface.co/datasets/AI4EPS/quakeflow_das/resolve/main/monterey_bay/data/20231109T130910Z.h5
+   ```
+
+3. List the input files in a CSV with a `path` column:
+
+   ```bash
+   (echo path; ls data/*.h5) > input_files.csv
+   ```
+
+4. Run prediction:
+
+   ```bash
+   python predict.py \
+     --checkpoint dasnet_swin_t_monterey.pth \
+     --data-list input_files.csv \
+     --output-dir results \
+     --plot-figure
+   ```
+
+   Add `--device cpu` if you have no GPU.
+
 ## Input data
 
-Preprocessed HDF5 files must contain a `data` dataset with shape
-`(number_of_channels, number_of_time_samples)` and a scalar `dt_s` attribute.
-The data is expected to be strain rate.
+Each HDF5 file needs a `data` dataset with shape `(channels, time_samples)` in
+strain rate, and a `dt_s` attribute with the sampling interval in seconds.
 
-Training annotations use COCO JSON. Each `images` entry must refer to an HDF5
-file through `file_name`, with `width` set to the time-sample count and `height`
-set to the channel count. An annotation uses:
+The pretrained model was trained on the Monterey Bay cable. For other cables,
+train your own model (see [Training](#training)).
 
-- `bbox`: `[time_start, channel_start, time_width, channel_height]`
-- `segmentation`: a flattened `[time, channel, ...]` polyline
-- `category_id`: an integer class identifier
+## Output
 
-For multiple arrival phases, provide additional polyline fields such as
-`segmentation_aux` and configure their count with `--mask-streams-by-class`.
+Prediction writes `results/<file>.json` for each input file:
+
+```json
+{
+  "file_name": "20231109T130910Z.h5",
+  "resize_scale": 0.5,
+  "instances": [
+    {
+      "box": [465.4, 5418.1, 2840.6, 7173.9],
+      "score": 0.9996,
+      "label": 3,
+      "picks_by_stream": [
+        {"stream": 0, "picks": [[466.0, 7096.0], [468.0, 7094.0]], "pick_scores": [0.55, 0.60]}
+      ]
+    }
+  ]
+}
+```
+
+- `box`: `[channel_start, time_start, channel_end, time_end]`, in channel and time-sample indices of the input file.
+- `picks`: `[channel, time_sample]` arrival picks. With the default `resize_scale` of 0.5, there is a pick on every second channel.
+- `picks_by_stream`: earthquakes (label 8) have two streams, 0 = P and 1 = S. Other labels have one.
+- `score`: detection confidence. Detections below `--min-probability` (default 0.3) are dropped.
+
+Labels of the pretrained model:
+
+| Label | Signal |
+|---|---|
+| 1 | Blue whale A |
+| 2 | Blue whale B |
+| 3 | Fin whale |
+| 4 | Others / unknown |
+| 5 | Blue whale D call |
+| 6 | T wave |
+| 7 | Ship |
+| 8 | Earthquake (P and S) |
+| 9 | Sei whale |
+
+With `--plot-figure`, figures are saved in `results/figures/`. Their axes are in
+the downsampled grid (input indices × `resize_scale`).
 
 ## Training
 
-Training defaults to **Swin-Tiny** with ImageNet initialization. Use
-`--backbone resnet50` to select the legacy backbone, or
-`--backbone-weights none` for random initialization. Swin's four stages feed the
-existing 128-channel FPN; their outputs are pooled by two to retain the legacy
-FPN strides. All Swin stages are trainable.
+Training labels are a COCO JSON file. Each `images` entry points to an HDF5 file
+through `file_name`, with `width` = number of time samples and `height` = number
+of channels. Each annotation has:
 
-The following command trains a one-class model plus background with two mask
-streams. Adjust paths and geometry for your dataset. Set `--num-classes` to
-`n + 1` for an `n`-class model.
+- `bbox`: `[time_start, channel_start, time_width, channel_height]`
+- `segmentation`: the arrival as a flattened `[time, channel, ...]` polyline
+- `segmentation_aux`: a second arrival (e.g. S), for classes with two streams
+- `category_id`: integer class ID
+
+Example: one class plus background, with two arrival streams for class 1:
 
 ```bash
 python train.py \
-  --backbone swin_t \
   --data-path /path/to/train_h5 \
   --anno-path /path/to/train.json \
   --val-data-path /path/to/validation_h5 \
@@ -64,66 +135,6 @@ python train.py \
   --epochs 100
 ```
 
-For multi-GPU training, launch the same command through `torchrun`, for example
-`torchrun --standalone --nproc_per_node=2 train.py ...`.
-
-The output directory contains `checkpoint.pth` and the validation-loss-best
-checkpoint `model_best.pth`.
-
-## Prediction
-
-Create a CSV with one local HDF5 path per row:
-
-```csv
-path
-/path/to/input_001.h5
-/path/to/input_002.h5
-```
-
-Prediction restores architecture and input geometry from the training
-checkpoint, without downloading initialization weights:
-
-```bash
-python predict.py \
-  --checkpoint output/run_01/model_best.pth \
-  --data-list input_files.csv \
-  --output-dir results
-```
-
-Checkpoints predating backbone metadata are treated as ResNet50. Explicit
-conflicting backbone options are rejected. For checkpoints without training
-arguments, supply the class count and matching input/mask/RPN settings manually.
-For raw SeaFOAM input, add `--from-raw --channel-start START --channel-end END`.
-
-Prediction writes one JSON file per HDF5 input. Each record contains detection
-boxes in `[channel_start, time_start, channel_end, time_end]` order and
-per-stream pick coordinates in `[channel, time]` order.
-
-With `--plot-figure`, all detected classes keep their boxes and labels. Arrival
-masks and picks are drawn only for categories 2 (Blue whale B), 3
-(Fin whale), and 8 (earthquake P/S). Use `--plot-arrival-classes` to supply other
-category IDs for a different dataset. This display filter does not change JSON
-predictions.
-
-The model architecture options, class count, input channel count, crop geometry,
-mask-stream configuration, learned temporal crop option, and RPN anchor settings
-must match the checkpoint. A mismatch can prevent checkpoint loading or produce
-invalid predictions.
-
-## Monterey temporal-crop geometry
-
-The training and prediction defaults are `--resize-scale 0.5`,
-`--transform-min-size 1422`, and `--transform-max-size 6000`.
-For native-resolution crop datasets, specify the desired resize and transform
-geometry explicitly (for example `--resize-scale 1.0` with 2048/4096).
-
-With `--use-learned-temporal-crop`, each stream uses a window of length
-`max(1, alpha * proposal_channel_width)` around its predicted anchor. The
-window keeps original image coordinates, including negative/beyond-end time
-coordinates. 
-
-Run geometry, backbone, backward-pass and checkpoint regression tests with:
-
-```bash
-OMP_NUM_THREADS=1 python -m unittest discover -s tests -v
-```
+Set `--num-classes` to the number of classes + 1. For multiple GPUs, use
+`torchrun --standalone --nproc_per_node=2 train.py ...`. The best model is saved
+as `output/run_01/model_best.pth` and can be used with `predict.py --checkpoint`.
